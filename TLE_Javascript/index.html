@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>TLE Generator</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/satellite.js/5.0.0/satellite.min.js"></script>
+  </head>
+  <body>
+    <div class="container">
+      <div style="width:65%">
+        <h1>📡 TLE Az/El Generator</h1>
+        <form id="tleForm">
+          <label>
+            TLE Name
+            <input type="text" id="tleName" value="EM1" />
+          </label>
+          <label>
+            Line 1
+            <input
+              type="text"
+              id="tleLine1"
+              value="1 44078U 19072A   25237.00127315  .00000014  00000-0  40313-4 0  1239"
+            />
+          </label>
+          <label>
+            Line 2
+            <input
+              type="text"
+              id="tleLine2"
+              value="2 44078  98.2808 291.9629 0018719  34.1424  38.1671 14.43768520337337"
+            />
+          </label>
+
+          <div class="grid">
+            <label
+              >Site Lat (deg)<input
+                type="number"
+                id="siteLat"
+                value="17.268660"
+            /></label>
+            <label
+              >Site Lon (deg)<input
+                type="number"
+                id="siteLon"
+                value="78.496172"
+            /></label>
+            <label
+              >Site Alt (m)<input type="number" id="siteAltM" value="0"
+            /></label>
+          </div>
+
+          <div class="grid">
+            <label for="startTime">Start Time (UTC):</label>
+            <input
+              type="datetime-local"
+              id="startTime"
+              step="1"
+              value="2025-08-25T03:39:25"
+            />
+
+            <label for="endTime">End Time (UTC):</label>
+            <input
+              type="datetime-local"
+              id="endTime"
+              step="1"
+              value="2025-08-25T03:54:00"
+            />
+          </div>
+
+          <div class="grid">
+            <label
+              >Resolution (s)<input type="number" id="resolution" value="1"
+            /></label>
+            <label
+              >Decimals<input type="number" id="decimals" value="2"
+            /></label>
+          </div>
+
+          <div class="grid">
+            <label
+              ><input type="checkbox" id="applyRefraction" checked /> Apply
+              Refraction</label
+            >
+            <label
+              >Tilt Angle (deg)<input type="number" id="tiltAngle" value="0"
+            /></label>
+            <label
+              >Tilt Azimuth (deg)<input
+                type="number"
+                id="tiltAzimuth"
+                value="0"
+            /></label>
+          </div>
+          <div id="controls" class="hidden button-bar">
+            <button type="submit">🚀 Generate</button>
+            <button id="downloadCSV">⬇ Download All CSV</button>
+            <button id="downloadPage">⬇ Download Page CSV</button>
+          </div>
+        </form>
+
+        <div id="progressContainer" class="hidden">
+          <div id="progressBar"></div>
+        </div>
+      </div>
+      <div style="width:35%">
+        <div id="controls" class="hidden button-bar">
+          <span id="pageInfo"></span>
+        </div>
+        <div id="controls" class="hidden button-bar">
+          <button id="prevPage">⬅ Prev</button>
+          <button id="nextPage">Next ➡</button>
+          <div>
+          <label>
+            Rows per page: 
+            <select id="rowsPerPage"  >
+              <option value="10">10</option>
+              <option value="20" selected>20 </option>
+              <option value="50" >50</option>
+              <option value="100">100</option>
+            </select>
+            </div>
+          </label> 
+        </div>
+
+        <table id="resultsTable" class="hidden">
+          <thead>
+            <tr>
+              <th>Time (UTC)</th>
+              <th>Az (°)</th>
+              <th>El (°)</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,1 @@
+javac -cp "lib/*" -d out TLE_Generation.java && java -cp "out;lib/*" TLE_Generation
