@@ -1,270 +1,436 @@
-// app.js
-// Updated: pagination + CSV download + robust gstime detection
+/* ======= Constants / Globals ======= */
+const TIMESTAMP_INDEX = 0;
+const AZIMUTH_INDEX   = 1;
+const ELEVATION_INDEX = 2;
 
-// --- Utilities (refraction + tilt + CSV) ---
-function pressureMbarBarometric(hMeters, p0Mbar = 1013.25) {
-  const T0 = 288.15, L = 0.0065, g = 9.80665, M = 0.0289644, R = 8.3144598;
-  return p0Mbar * Math.pow(1.0 - (L * hMeters) / T0, (g * M) / (R * L));
-}
+let allResults = [];          // Array<[timeISO, azDegStr, elDegStr>]
+let groupedPasses = [];       // Array<Array<[timeISO, azStr, elStr]>>
+let groupedSummary = [];      // Array<summary objects>
 
-function refractBennettDeg(altitudeDeg, tempC = 15.0, pressureMbar = 1013.25) {
-  if (altitudeDeg <= -1.0) return altitudeDeg;
-  const altRad = altitudeDeg * Math.PI / 180;
-  const R_arcmin = (pressureMbar / 1010.0) * (283.0 / (273.0 + tempC)) *
-    (1.02 / Math.tan(altRad + (10.3 / (altitudeDeg + 5.11)) * Math.PI / 180));
-  return altitudeDeg + R_arcmin / 60.0;
-}
+const modalState = {
+  groupIndex: -1,
+  page: 1,
+  rowsPerPage: 20
+};
 
-function applyTilt(azDeg, elDeg, tiltDeg, tiltAzDeg) {
-  const az = azDeg * Math.PI / 180, el = elDeg * Math.PI / 180;
-  const xE = Math.cos(el) * Math.sin(az);
-  const yN = Math.cos(el) * Math.cos(az);
-  const zU = Math.sin(el);
-  const tAz = tiltAzDeg * Math.PI / 180;
-  const ax = Math.sin(tAz), ay = Math.cos(tAz), azAxis = 0.0;
-  const theta = tiltDeg * Math.PI / 180;
-  const kDotV = ax * xE + ay * yN + azAxis * zU;
-  const kxVx = ay * zU - azAxis * yN;
-  const kxVy = azAxis * xE - ax * zU;
-  const kxVz = ax * yN - ay * xE;
+/* ======= Helpers: DOM ======= */
+const $ = (sel) => document.querySelector(sel);
 
-  const xR = xE * Math.cos(theta) + kxVx * Math.sin(theta) + ax * kDotV * (1.0 - Math.cos(theta));
-  const yR = yN * Math.cos(theta) + kxVy * Math.sin(theta) + ay * kDotV * (1.0 - Math.cos(theta));
-  const zR = zU * Math.cos(theta) + kxVz * Math.sin(theta) + azAxis * kDotV * (1.0 - Math.cos(theta));
-
-  const elTiltDeg = Math.asin(Math.max(-1, Math.min(1, zR))) * 180.0 / Math.PI;
-  let azTiltDeg = Math.atan2(xR, yR) * 180.0 / Math.PI;
-  if (azTiltDeg < 0) azTiltDeg += 360.0;
-  return [azTiltDeg, elTiltDeg];
-}
-
-function formatUtcSeconds(d) {
-  // "YYYY-MM-DD HH:mm:ss"
-  const Y = d.getUTCFullYear();
-  const M = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const D = String(d.getUTCDate()).padStart(2, '0');
-  const hh = String(d.getUTCHours()).padStart(2, '0');
-  const mm = String(d.getUTCMinutes()).padStart(2, '0');
-  const ss = String(d.getUTCSeconds()).padStart(2, '0');
-  return `${Y}-${M}-${D} ${hh}:${mm}:${ss}`;
-}
-
-function downloadCsv(filename, headerRow, rows) {
-  // headerRow: array of column names
-  // rows: array of arrays
-  if (!rows || rows.length === 0) {
-    alert('No data to download.');
-    return;
+function setProgress(p) {
+  const wrap = $('#progressWrap');
+  const bar = $('#progressBar');
+  wrap.classList.remove('hidden');
+  wrap.setAttribute('aria-hidden', 'false');
+  bar.style.width = `${Math.max(0, Math.min(100, p))}%`;
+  if (p >= 100) {
+    setTimeout(() => {
+      wrap.classList.add('hidden');
+      wrap.setAttribute('aria-hidden', 'true');
+      bar.style.width = '0%';
+    }, 400);
   }
-  const esc = field => {
-    if (field == null) return '""';
-    const s = String(field).replace(/"/g, '""');
-    return `"${s}"`;
+}
+
+function fmtISO(d) {
+  const z = (n, w=2) => String(n).padStart(w, '0');
+  return `${d.getUTCFullYear()}-${z(d.getUTCMonth()+1)}-${z(d.getUTCDate())} `
+       + `${z(d.getUTCHours())}:${z(d.getUTCMinutes())}:${z(d.getUTCSeconds())}.${z(d.getUTCMilliseconds(),3)}`;
+}
+const toRadians = (d) => d * Math.PI / 180;
+const toDegrees = (r) => r * 180 / Math.PI;
+
+/* ======= Ensure libraries (fallback ESM) ======= */
+async function ensureSatelliteLoaded() {
+  if (typeof window.satellite === 'undefined') {
+    const mod = await import('https://cdn.jsdelivr.net/npm/satellite.js@6.0.1/+esm');
+    window.satellite = mod;
+  }
+}
+async function ensureJSZipLoaded() {
+  if (typeof window.JSZip === 'undefined') {
+    const mod = await import('https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm');
+    window.JSZip = mod.default || mod;
+  }
+}
+
+/* ======= Refraction & Pressure ======= */
+function pressureMbarFromAltMeters(h_m) {
+  return 1013.25 * Math.pow(1 - 2.25577e-5 * h_m, 5.25588);
+}
+function refractElevationDeg(elDeg, pressure_mbar, temp_c) {
+  if (elDeg <= -1) return elDeg;
+  const T_k = 273.15 + temp_c;
+  const R_arcmin = 1.02 / Math.tan(toRadians(elDeg + 10.3 / (elDeg + 5.11)));
+  const scale = (pressure_mbar / 1010.0) * (283.0 / T_k);
+  return elDeg + (R_arcmin * scale) / 60.0;
+}
+
+/* ======= Tilt correction ======= */
+function applyTilt(azDeg, elDeg, tiltDeg, tiltAzDeg) {
+  if (!tiltDeg) return [azDeg, elDeg];
+
+  const az = toRadians(azDeg);
+  const el = toRadians(elDeg);
+  const t  = toRadians(tiltDeg);
+  const tz = toRadians(tiltAzDeg);
+
+  const E = Math.cos(el) * Math.sin(az);
+  const N = Math.cos(el) * Math.cos(az);
+  const U = Math.sin(el);
+  const v = [E, N, U];
+
+  // Axis k = u × d, with u=[0,0,1], d=[sin tz, cos tz, 0] => k=[-cos tz, sin tz, 0]
+  const k = [-Math.cos(tz), Math.sin(tz), 0];
+
+  const ct = Math.cos(-t), st = Math.sin(-t);
+  const kx = k[0], ky = k[1], kz = k[2];
+  const cross = [
+    ky * v[2] - kz * v[1],
+    kz * v[0] - kx * v[2],
+    kx * v[1] - ky * v[0]
+  ];
+  const dot = kx * v[0] + ky * v[1] + kz * v[2];
+  const vPrime = [
+    v[0] * ct + cross[0] * st + kx * dot * (1 - ct),
+    v[1] * ct + cross[1] * st + ky * dot * (1 - ct),
+    v[2] * ct + cross[2] * st + kz * dot * (1 - ct)
+  ];
+
+  const E2 = vPrime[0], N2 = vPrime[1], U2 = vPrime[2];
+  let az2 = toDegrees(Math.atan2(E2, N2));
+  if (az2 < 0) az2 += 360;
+  const el2 = toDegrees(Math.asin(Math.max(-1, Math.min(1, U2))));
+  return [az2, el2];
+}
+
+/* ======= CSV / ZIP helpers ======= */
+function toCsv(headers, rows) {
+  const esc = (s) => {
+    const t = String(s ?? '');
+    return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
   };
-  const lines = [headerRow.map(esc).join(',')];
-  for (const r of rows) lines.push(r.map(esc).join(','));
-  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const head = headers.map(esc).join(',');
+  const body = rows.map(r => r.map(esc).join(',')).join('\n');
+  return head + '\n' + body;
+}
+function downloadBlob(filename, blob) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
   a.download = filename;
   document.body.appendChild(a);
   a.click();
+  URL.revokeObjectURL(url);
   a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+function downloadCsv(filename, headers, rows) {
+  const csv = toCsv(headers, rows);
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  downloadBlob(filename, blob);
 }
 
-// --- GSTIME compatibility ---
-function getGmst(date) {
-  if (typeof satellite.gstime === 'function') return satellite.gstime(date);
-  if (typeof satellite.gstimeFromDate === 'function') return satellite.gstimeFromDate(date);
-  // As a last resort attempt common alternate name:
-  if (typeof satellite.siderealTime === 'function') return satellite.siderealTime(date);
-  throw new Error('satellite.js GSTIME function not found (tried gstime, gstimeFromDate, siderealTime). Please check your satellite.js build.');
+/* ======= Grouping ======= */
+function groupPositiveAzEl(rows) {
+  const groups = [];
+  let cur = [];
+  for (const r of rows) {
+    const az = parseFloat(r[AZIMUTH_INDEX]);
+    const el = parseFloat(r[ELEVATION_INDEX]);
+    if (az > 0 && el > 0) {
+      cur.push(r);
+    } else if (cur.length) {
+      groups.push(cur);
+      cur = [];
+    }
+  }
+  if (cur.length) groups.push(cur);
+  return groups;
 }
 
-// --- global state for paging + results ---
-let allResults = [];      // array of [timeStr, azStr, elStr]
-let currentPage = 1;
-let rowsPerPage = 20;  // change if you want smaller/larger pages
+function summarizeGroups(groups) {
+  return groups.map((g, idx) => {
+    const start = g[0];
+    const end   = g[g.length - 1];
 
-// --- DOM helpers ---
-function showControls(show) {
-  const controls = document.getElementById('controls');
-  if (!controls) return;
-  controls.classList.toggle('hidden', !show);
+    let minEl = +g[0][ELEVATION_INDEX];
+    let maxEl = +g[0][ELEVATION_INDEX];
+    for (const row of g) {
+      const el = +row[ELEVATION_INDEX];
+      if (el < minEl) minEl = el;
+      if (el > maxEl) maxEl = el;
+    }
+
+    const d = decimals();
+    return {
+      idx,
+      startTime: start[TIMESTAMP_INDEX],
+      endTime: end[TIMESTAMP_INDEX],
+      minEl: minEl.toFixed(d),
+      maxEl: maxEl.toFixed(d),
+      startAz: (+start[AZIMUTH_INDEX]).toFixed(d),
+      endAz: (+end[AZIMUTH_INDEX]).toFixed(d),
+      count: g.length
+    };
+  });
 }
 
-function showProgress(show) {
-  const progressContainer = document.getElementById('progressContainer');
-  if (!progressContainer) return;
-  progressContainer.classList.toggle('hidden', !show);
-}
-
-// --- paging / rendering ---
-function renderPage(page = 1) {
-  if (!Array.isArray(allResults)) return;
-  const total = allResults.length;
-  const pageCount = Math.max(1, Math.ceil(total / rowsPerPage));
-  if (page < 1) page = 1;
-  if (page > pageCount) page = pageCount;
-  currentPage = page;
-
-  // slice results
-  const startIdx = (currentPage - 1) * rowsPerPage;
-  const endIdx = Math.min(total, startIdx + rowsPerPage);
-
-  const table = document.getElementById('resultsTable');
-  if (!table) return;
+function renderGroupSummary(summary) {
+  const table = $('#groupTable');
   const tbody = table.querySelector('tbody');
+  const emptyMsg = $('#noGroupsMsg');
+  const countLabel = $('#groupCountLabel');
   tbody.innerHTML = '';
 
-  for (let i = startIdx; i < endIdx; i++) {
-    const r = allResults[i];
+  summary.forEach((s, i) => {
     const tr = document.createElement('tr');
-    const tdTime = document.createElement('td'); tdTime.textContent = r[0]; tr.appendChild(tdTime);
-    const tdAz = document.createElement('td'); tdAz.textContent = r[1]; tr.appendChild(tdAz);
-    const tdEl = document.createElement('td'); tdEl.textContent = r[2]; tr.appendChild(tdEl);
+    const c = (text) => { const td = document.createElement('td'); td.textContent = text; return td; };
+    tr.appendChild(c(i + 1));
+    tr.appendChild(c(s.startTime));
+    tr.appendChild(c(s.endTime));
+    tr.appendChild(c(s.minEl));
+    tr.appendChild(c(s.maxEl));
+    tr.appendChild(c(s.startAz));
+    tr.appendChild(c(s.endAz));
+    tr.appendChild(c(s.count));
+
+    const actionTd = document.createElement('td');
+    const viewBtn = document.createElement('button');
+    viewBtn.textContent = 'View';
+    viewBtn.addEventListener('click', () => showGroupDetails(s.idx));
+    actionTd.appendChild(viewBtn);
+    tr.appendChild(actionTd);
+
+    tbody.appendChild(tr);
+  });
+
+  const has = summary.length > 0;
+  table.classList.toggle('hidden', !has);
+  emptyMsg.classList.toggle('hidden', has);
+  countLabel.textContent = has ? `${summary.length} group(s)` : '';
+  $('#downloadGroupsZipBtn').disabled = !has;
+}
+
+/* ======= Modal (pagination inside modal) ======= */
+function renderGroupModalPage() {
+  const g = groupedPasses[modalState.groupIndex] || [];
+  const total = g.length;
+  const pages = Math.max(1, Math.ceil(total / modalState.rowsPerPage));
+  modalState.page = Math.max(1, Math.min(modalState.page, pages));
+
+  const startIdx = (modalState.page - 1) * modalState.rowsPerPage;
+  const endIdx = Math.min(total, startIdx + modalState.rowsPerPage);
+  const slice = g.slice(startIdx, endIdx);
+
+  const tbody = $('#groupDetailsTable tbody');
+  tbody.innerHTML = '';
+  for (const r of slice) {
+    const tr = document.createElement('tr');
+    const tdT = document.createElement('td'); tdT.textContent = r[TIMESTAMP_INDEX];
+    const tdA = document.createElement('td'); tdA.textContent = r[AZIMUTH_INDEX];
+    const tdE = document.createElement('td'); tdE.textContent = r[ELEVATION_INDEX];
+    tr.appendChild(tdT); tr.appendChild(tdA); tr.appendChild(tdE);
     tbody.appendChild(tr);
   }
 
-  // show table & controls
-  table.classList.remove('hidden');
-  showControls(true);
-
-  // update pageInfo
-  const pageInfo = document.getElementById('pageInfo');
-  if (pageInfo) {
-    pageInfo.textContent = `Page ${currentPage} / ${pageCount} — showing ${startIdx + 1}–${endIdx} of ${total}`;
-  }
-
-  // enable/disable prev/next buttons
-  const prev = document.getElementById('prevPage');
-  const next = document.getElementById('nextPage');
-  if (prev) prev.disabled = (currentPage <= 1);
-  if (next) next.disabled = (currentPage >= pageCount);
-
-  // enable download buttons if data exists
-  const dlAll = document.getElementById('downloadCSV');
-  const dlPage = document.getElementById('downloadPage');
-  if (dlAll) dlAll.disabled = total === 0;
-  if (dlPage) dlPage.disabled = total === 0;
+  $('#modalPageInfo').textContent = `Page ${modalState.page}/${pages} • ${total} rows`;
+  $('#modalPrevBtn').disabled = modalState.page <= 1;
+  $('#modalNextBtn').disabled = modalState.page >= pages;
 }
 
-// --- form submit / generator ---
-document.getElementById('tleForm').addEventListener('submit', async (evt) => {
-  evt.preventDefault();
+function showGroupDetails(groupIndex) {
+  modalState.groupIndex = groupIndex;
+  modalState.page = 1;
 
-  // read fields
-  const tleLine1 = document.getElementById('tleLine1').value.trim();
-  const tleLine2 = document.getElementById('tleLine2').value.trim();
-  const siteLat = parseFloat(document.getElementById('siteLat').value);
-  const siteLon = parseFloat(document.getElementById('siteLon').value);
-  const siteAltM = parseFloat(document.getElementById('siteAltM').value || '0');
-  const startVal = document.getElementById('startTime').value;
-  const endVal = document.getElementById('endTime').value;
-  const resolutionSeconds = parseFloat(document.getElementById('resolution').value || '1');
-  const decimals = parseInt(document.getElementById('decimals') ? document.getElementById('decimals').value : '2', 10) || 2;
-  const applyRefraction = !!document.getElementById('applyRefraction') && document.getElementById('applyRefraction').checked;
-  const tiltAngle = parseFloat(document.getElementById('tiltAngle').value || '0');
-  const tiltAzimuth = parseFloat(document.getElementById('tiltAzimuth').value || '0');
+  const g = groupedPasses[groupIndex] || [];
+  $('#groupTitle').textContent = `Group #${groupIndex + 1} — ${g.length} samples`;
 
-  if (!tleLine1 || !tleLine2) { alert('Please provide TLE lines'); return; }
-  if (!startVal || !endVal) { alert('Please provide Start and End time'); return; }
+  renderGroupModalPage();
 
-  // parse start/end as UTC (datetime-local gives local; user had 'Z' appended earlier)
-  // The uploaded index.html uses values like 2025-08-25T03:39:25 (no timezone). We'll treat them as UTC:
-  const start = new Date(startVal + 'Z');
-  const end = new Date(endVal + 'Z');
-  if (isNaN(start) || isNaN(end) || start > end) { alert('Invalid start/end'); return; }
+  // CSV for entire group
+  $('#downloadGroupCsv').onclick = () => {
+    downloadCsv(`group_${String(groupIndex + 1).padStart(2,'0')}.csv`,
+      ['time_utc','az_deg','el_deg'],
+      g
+    );
+  };
 
-  const resolutionMs = Math.max(1, Math.floor(resolutionSeconds * 1000));
-  const satrec = satellite.twoline2satrec(tleLine1, tleLine2);
-  const pressureMbar = pressureMbarBarometric(siteAltM);
+  const modal = $('#groupModal');
+  modal.classList.remove('hidden');
+  modal.setAttribute('aria-hidden', 'false');
+}
 
-  // prepare UI
-  showProgress(true);
-  const prog = document.getElementById('progressBar');
-  if (prog) prog.style.width = '0%';
+(function wireModalControls(){
+  // Rows per page selector
+  $('#modalRowsPerPage').addEventListener('change', (e) => {
+    modalState.rowsPerPage = parseInt(e.target.value, 10) || 20;
+    renderGroupModalPage();
+  });
+  // Prev/Next
+  $('#modalPrevBtn').addEventListener('click', () => {
+    modalState.page -= 1;
+    renderGroupModalPage();
+  });
+  $('#modalNextBtn').addEventListener('click', () => {
+    modalState.page += 1;
+    renderGroupModalPage();
+  });
 
-  // generate rows in chunks so UI stays responsive
-  allResults = [];
-  const chunk = 200; // update UI every 200 steps
-  const totalSteps = Math.max(1, Math.ceil((end - start) / resolutionMs) + 1);
-  let step = 0;
+  // Close only on close button or backdrop
+  const modal = $('#groupModal');
+  const closeBtn = $('#closeModal');
+  const backdrop = modal ? modal.querySelector('.modal-backdrop') : null;
+  const content = modal ? modal.querySelector('.modal-content') : null;
 
-  for (let t = start.getTime(); t <= end.getTime(); t += resolutionMs) {
-    const date = new Date(t);
-    const pv = satellite.propagate(satrec, date);
-    if (pv && pv.position) {
-      // robust GMST getter
-      let gmst;
-      try { gmst = getGmst(date); } catch (err) { console.error(err); alert(err.message); showProgress(false); return; }
+  const close = () => {
+    modal.classList.add('hidden');
+    modal.setAttribute('aria-hidden', 'true');
+  };
 
-      const posEcf = satellite.eciToEcf(pv.position, gmst);
-      const observerGd = { longitude: siteLon * Math.PI / 180.0, latitude: siteLat * Math.PI / 180.0, height: siteAltM / 1000.0 };
-      const look = satellite.ecfToLookAngles(observerGd, posEcf);
-      let azDeg = look.azimuth * 180 / Math.PI;
-      let elDeg = look.elevation * 180 / Math.PI;
-      if (azDeg < 0) azDeg += 360;
-      if (applyRefraction) elDeg = refractBennettDeg(elDeg, 15.0, pressureMbar);
-      [azDeg, elDeg] = applyTilt(azDeg, elDeg, tiltAngle, tiltAzimuth);
+  if (closeBtn) closeBtn.addEventListener('click', close);
+  if (backdrop) backdrop.addEventListener('click', close);
 
-      allResults.push([formatUtcSeconds(date), azDeg.toFixed(decimals), elDeg.toFixed(decimals)]);
-    }
-    step++;
-    // periodic UI update
-    if (step % chunk === 0) {
-      const pct = Math.min(100, Math.round((step / totalSteps) * 100));
-      if (prog) prog.style.width = pct + '%';
-      // yield to UI
-      // small pause to allow repaint & event handling
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise(r => setTimeout(r, 8));
-    }
+  // Ensure clicks inside modal do NOT close (extra safety)
+  if (content) content.addEventListener('click', (e) => e.stopPropagation());
+})();
+
+/* ======= UI getters ======= */
+function decimals() { return Math.max(0, Math.min(6, parseInt($('#decimals').value || '0', 10))); }
+
+/* ======= Resolution (ms, forced to multiples of 100 ms) ======= */
+function readStepMs() {
+  let v = parseInt($('#resolutionMs')?.value || '100', 10);
+  if (isNaN(v)) v = 100;
+  v = Math.max(100, Math.round(v / 100) * 100); // multiple of 100ms
+  if ($('#resolutionMs')) $('#resolutionMs').value = v; // normalize UI display
+  return v;
+}
+
+/* ======= ZIP: all groups ======= */
+async function downloadGroupsZip() {
+  if (!groupedPasses.length) return;
+  await ensureJSZipLoaded();
+  const zip = new JSZip();
+
+  // 1) One CSV per group
+  const headers = ['time_utc','az_deg','el_deg'];
+  groupedPasses.forEach((g, i) => {
+    const csv = toCsv(headers, g);
+    zip.file(`group_${String(i+1).padStart(2,'0')}.csv`, csv);
+  });
+
+  // 2) Add a summary CSV
+  const summaryHeaders = ['group_index','start_utc','end_utc','min_el_deg','max_el_deg','start_az_deg','end_az_deg','samples'];
+  const summaryRows = groupedSummary.map(s => [
+    s.idx + 1, s.startTime, s.endTime, s.minEl, s.maxEl, s.startAz, s.endAz, s.count
+  ]);
+  zip.file('groups_summary.csv', toCsv(summaryHeaders, summaryRows));
+
+  const blob = await zip.generateAsync({ type: 'blob' });
+  downloadBlob('groups.zip', blob);
+}
+
+/* ======= Main compute ======= */
+async function generate() {
+  await ensureSatelliteLoaded();
+
+  const l1 = $('#tleL1').value.trim();
+  const l2 = $('#tleL2').value.trim();
+
+  const latDeg = parseFloat($('#obsLat').value);
+  const lonDeg = parseFloat($('#obsLon').value);
+  const altM   = parseFloat($('#obsAltM').value);
+  const altKm  = altM / 1000.0;
+
+  const startLocal = $('#startTime').value;
+  const endLocal   = $('#endTime').value;
+  if (!startLocal || !endLocal) {
+    alert('Please set start and end times.');
+    return;
   }
-
-  // finish
-  if (prog) prog.style.width = '100%';
-  showProgress(false);
-
-  if (allResults.length === 0) {
-    alert('No valid position samples produced for this TLE/time range.');
-    renderPage(1); // will hide controls
+  const start = new Date(startLocal);
+  const end   = new Date(endLocal);
+  if (isNaN(start) || isNaN(end) || end <= start) {
+    alert('Invalid time range.');
     return;
   }
 
-  // show first page
-  renderPage(1);
-});
+  // Sampling in milliseconds (multiples of 100 ms)
+  const stepMs = readStepMs();
+  const nSteps = Math.floor((end - start) / stepMs) + 1;
 
-// --- pagination / download handlers ---
-// Prev / Next
-const prevBtn = document.getElementById('prevPage');
-const nextBtn = document.getElementById('nextPage');
-const downloadAllBtn = document.getElementById('downloadCSV');
-const downloadPageBtn = document.getElementById('downloadPage');
+  const applyRef = $('#applyRefraction').checked;
+  const tempC    = parseFloat($('#tempC').value);
+  const pressure = pressureMbarFromAltMeters(altM);
 
-if (prevBtn) prevBtn.addEventListener('click', () => { renderPage(currentPage - 1); });
-if (nextBtn) nextBtn.addEventListener('click', () => { renderPage(currentPage + 1); });
+  const tiltDeg  = parseFloat($('#tiltDeg').value) || 0;
+  const tiltAz   = parseFloat($('#tiltAzDeg').value) || 0;
 
-// Download full CSV
-if (downloadAllBtn) downloadAllBtn.addEventListener('click', () => {
-  if (!allResults || allResults.length === 0) { alert('No data to download'); return; }
-  downloadCsv('tle_az_el.csv', ['time_utc', 'az_deg', 'el_deg'], allResults);
-});
+  // Prepare propagator
+  const satrec = satellite.twoline2satrec(l1, l2);
+  const observerGd = {
+    longitude: toRadians(lonDeg),
+    latitude: toRadians(latDeg),
+    height: altKm
+  };
 
-// Download current page
-if (downloadPageBtn) downloadPageBtn.addEventListener('click', () => {
-  if (!allResults || allResults.length === 0) { alert('No data to download'); return; }
-  const startIdx = (currentPage - 1) * rowsPerPage;
-  const endIdx = Math.min(allResults.length, startIdx + rowsPerPage);
-  const pageRows = allResults.slice(startIdx, endIdx);
-  downloadCsv(`tle_az_el_page${currentPage}.csv`, ['time_utc', 'az_deg', 'el_deg'], pageRows);
-});
+  allResults = [];
+  setProgress(0);
 
-document.getElementById("rowsPerPage").addEventListener("change", (e) => {
-  rowsPerPage = parseInt(e.target.value, 10);
-  currentPage = 1; // reset to first page
-  renderPage(currentPage);
+  // Update progress roughly every ~2 seconds worth of samples
+  const chunk = Math.max(100, Math.floor(20000 / stepMs));
+  for (let i = 0; i < nSteps; i += 1) {
+    const t = new Date(start.getTime() + i * stepMs);
+
+    const pv = satellite.propagate(satrec, t);
+    if (!pv.position) continue;
+
+    const gmst = satellite.gstime(t);
+    const positionEcf = satellite.eciToEcf(pv.position, gmst);
+
+    const look = satellite.ecfToLookAngles(observerGd, positionEcf);
+    let azDeg = (toDegrees(look.azimuth) + 360) % 360;
+    let elDeg = toDegrees(look.elevation);
+
+    [azDeg, elDeg] = applyTilt(azDeg, elDeg, tiltDeg, tiltAz);
+    if (applyRef) elDeg = refractElevationDeg(elDeg, pressure, tempC);
+
+    allResults.push([fmtISO(t), azDeg.toFixed(decimals()), elDeg.toFixed(decimals())]);
+
+    if ((i % chunk) === 0 || i === nSteps - 1) {
+      setProgress(Math.floor((i + 1) * 100 / nSteps));
+      await new Promise(requestAnimationFrame);
+    }
+  }
+
+  // Enable all-CSV download
+  $('#downloadAllBtn').disabled = allResults.length === 0;
+  $('#downloadAllBtn').onclick = () => {
+    if (!allResults.length) return;
+    downloadCsv('all_results.csv', ['time_utc','az_deg','el_deg'], allResults);
+  };
+
+  // Grouping → Summary
+  groupedPasses  = groupPositiveAzEl(allResults);
+  groupedSummary = summarizeGroups(groupedPasses);
+  renderGroupSummary(groupedSummary);
+}
+
+/* ======= Wire UI ======= */
+window.addEventListener('DOMContentLoaded', () => {
+  // Defaults for datetime-local (now .. +15 min)
+  const now = new Date();
+  const round = (ms, step) => new Date(Math.ceil(ms / step) * step);
+  const step = 60_000; // to minutes
+  const start = round(now.getTime(), step);
+  const end = new Date(start.getTime() + 15 * 60_000);
+
+  const fmtLocal = (d) => {
+    const z = (n, w=2) => String(n).padStart(w, '0');
+    return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}T${z(d.getHours())}:${z(d.getMinutes())}`;
+  };
+  $('#startTime').value = fmtLocal(start);
+  $('#endTime').value   = fmtLocal(end);
+
+  $('#generateBtn').addEventListener('click', generate);
+  $('#downloadGroupsZipBtn').addEventListener('click', downloadGroupsZip);
 });
