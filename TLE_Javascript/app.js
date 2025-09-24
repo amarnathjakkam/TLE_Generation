@@ -1,19 +1,19 @@
 /* =========================
-   TLE Pass Generator – app.js (aligned to index.html)
+   TLE Pass Generator – app.js (UTC + Bennett refraction)
    ========================= */
 
 /* ---------- Constants / Globals ---------- */
 const IDX_T = 0, IDX_AZ = 1, IDX_EL = 2;
 
-// Default time range (UTC) — 24-08-2025 02:00 → 25-08-2025 02:00
+// Default time range (UTC) — 24-08-2025 02:00 → 26-08-2025 02:00
 const DEFAULT_START_UTC = new Date(Date.UTC(2025, 7, 25, 2, 0, 0));
 const DEFAULT_END_UTC   = new Date(Date.UTC(2025, 7, 26, 2, 0, 0));
 
 // Built-in fallback TLE (works even if no file is loaded)
 const DEFAULT_TLE_TEXT = `
-ISS (ZARYA)
-1 25544U 98067A   25235.50000000  .00016717  00000-0  10270-3 0  9991
-2 25544  51.6430  90.0000 0004500  75.0000  30.0000 15.50000000  0001
+EM1
+1 44078U 19072A   25237.00127315  .00000014  00000-0  40313-4 0  1239
+2 44078  98.2808 291.9629 0018719  34.1424  38.1671 14.43768520337337
 `.trim();
 
 let parsedTLEs = [];          // [{name,l1,l2}]
@@ -28,7 +28,6 @@ const $$ = (s) => Array.from(document.querySelectorAll(s));
 const byId = (id) => document.getElementById(id);
 
 function pad2(n){ return String(n).padStart(2,'0'); }
-function pad3(n){ return String(n).padStart(3,'0'); }
 function toRad(d){ return d*Math.PI/180; }
 function toDeg(r){ return r*180/Math.PI; }
 function isoUTC(d){ return new Date(d).toISOString().replace('.000',''); }
@@ -51,36 +50,38 @@ function downloadCsv(name, headers, rows){
   downloadBlob(name, new Blob([csv(headers, rows)],{type:'text/csv'}));
 }
 
-// datetime-local filler (local naive)
-function setDateTimeLocal(id, date){
+/* ---------- UTC datetime-local filler ---------- */
+// Force inputs to display **UTC** values (not local)
+function setDateTimeUTC(id, date){
   const el = byId(id); if (!el) return;
   const dt = new Date(date);
-  const y = dt.getFullYear(), m = pad2(dt.getMonth()+1), d=pad2(dt.getDate());
-  const H = pad2(dt.getHours()), M = pad2(dt.getMinutes());
+  const y = dt.getUTCFullYear(), m = pad2(dt.getUTCMonth()+1), d=pad2(dt.getUTCDate());
+  const H = pad2(dt.getUTCHours()), M = pad2(dt.getUTCMinutes());
   el.value = `${y}-${m}-${d}T${H}:${M}`;
 }
 function ensureDefaultTimeRange(){
-  if (!byId('startTime').value) setDateTimeLocal('startTime', DEFAULT_START_UTC);
-  if (!byId('endTime').value)   setDateTimeLocal('endTime',   DEFAULT_END_UTC);
+  if (!byId('startTime').value) setDateTimeUTC('startTime', DEFAULT_START_UTC);
+  if (!byId('endTime').value)   setDateTimeUTC('endTime',   DEFAULT_END_UTC);
 }
 
-/* ---------- Atmosphere helpers ---------- */
-function pressure_mbar_from_alt_km(alt_km){
-  const h = Math.max(0, alt_km*1000);
-  const p0=1013.25, T0=288.15, L=0.0065, g=9.80665, R=287.053;
-  if (h<=11000) return p0*Math.pow(1-(L*h)/T0, g/(R*L));
-  const p11=p0*Math.pow(1-(L*11000)/T0, g/(R*L));
-  const T11=T0-L*11000;
-  return p11*Math.exp(-(g/(R*T11))*(h-11000));
+/* ---------- Atmosphere helpers (barometric pressure + Bennett refraction) ---------- */
+// Approx barometric formula (sea-level p0=1013.25 mbar), altitude in **meters**
+function pressure_mbar_from_alt_m(alt_m, p0mbar = 1013.25){
+  const T0 = 288.15, L = 0.0065, g = 9.80665, M = 0.0289644, R = 8.3144598;
+  // Tropospheric (to ~11km): p = p0 * (1 - L*h/T0)^(g*M/(R*L))
+  const h = Math.max(0, alt_m);
+  return p0mbar * Math.pow(1.0 - (L * h) / T0, (g * M) / (R * L));
 }
 
-// Saemundsson refraction (deg) approx; el in deg, P in mbar, T in °C
-function refraction_deg(elDeg, Pmbar, TdegC){
-  // below horizon we skip
-  if (elDeg <= 0) return 0;
-  const e = toRad(elDeg);
-  const R_arcmin = (1.02 / Math.tan(e + 10.3/(e + 5.11))) * (Pmbar/1010) * (283/(273+TdegC));
-  return R_arcmin / 60.0;
+// Bennett/Saemundsson style refraction in **degrees**; returns corrected elevation (deg)
+// altDeg (geometric), tempC, pressure in mbar
+function refract_bennett_deg(altDeg, tempC, pressureMbar){
+  // If below horizon, skip correction
+  if (altDeg <= -1.0) return altDeg;
+  const altRad = toRad(altDeg);
+  const R_arcmin = (pressureMbar / 1010.0) * (283.0 / (273.0 + tempC))
+                 * (1.02 / Math.tan(altRad + (10.3 * Math.PI/180.0) / (altDeg + 5.11)));
+  return altDeg + (R_arcmin / 60.0);
 }
 
 /* ---------- Tilt correction ---------- */
@@ -129,30 +130,43 @@ function loadDefaultTLEIfEmpty(){
   fillTlePickerToFields();
 }
 
-/* ---------- Compute track ---------- */
+/* ---------- Compute track (UTC, Bennett refraction) ---------- */
 function computeTrackForTLE(satrec, startDate, endDate, stepMs, obs, doRefract, tempC){
   const rows=[];
   const start=+startDate, end=+endDate, step=Math.max(100, stepMs|0);
-  const P = pressure_mbar_from_alt_km(obs.alt_km);
+  // Pressure from **meters** altitude
+  const Pmbar = pressure_mbar_from_alt_m(obs.alt_m);
 
   for (let t=start; t<=end; t+=step){
-    const dt = new Date(t);
-    const gmst = satellite.gstime(dt);
+    const dt = new Date(t);                  // UTC based
+    const gmst = satellite.gstime(dt);       // v6 API (index.html loads 6.x):contentReference[oaicite:2]{index=2}
     const pv = satellite.propagate(satrec, dt);
-    if (!pv.position) continue;
+    if (!pv.position) {
+      rows.push([isoUTC(dt), NaN, NaN]);
+      continue;
+    }
 
-    const observerGd = { longitude: toRad(obs.lon), latitude: toRad(obs.lat), height: obs.alt_km };
-    const look = satellite.ecfToLookAngles(observerGd, satellite.eciToEcf(pv.position, gmst));
+    const posEcf = satellite.eciToEcf(pv.position, gmst);
+    const observerGd = {
+      longitude: toRad(obs.lon),
+      latitude : toRad(obs.lat),
+      height   : obs.alt_m / 1000.0  // km
+    };
+    const look = satellite.ecfToLookAngles(observerGd, posEcf);
 
-    let az = (toDeg(look.azimuth)+360)%360;
-    let el = toDeg(look.elevation);
+    // Angles in degrees, az normalized to [0,360)
+    let az = (toDeg(look.azimuth) + 360) % 360;
+    let el =  toDeg(look.elevation);
 
+    // Optional tilt
     if (obs.tiltDeg){
       const c = applyTilt(az, el, obs.tiltDeg, obs.tiltAzDeg||0);
       az = c.az; el = c.el;
     }
+
+    // Optional Bennett refraction
     if (doRefract){
-      el += refraction_deg(el, P, tempC);
+      el = refract_bennett_deg(el, tempC, Pmbar);
     }
 
     rows.push([isoUTC(dt), Number(az.toFixed(2)), Number(el.toFixed(2))]);
@@ -162,7 +176,7 @@ function computeTrackForTLE(satrec, startDate, endDate, stepMs, obs, doRefract, 
 
 /* ---------- Grouping & stats ---------- */
 function groupRows(rows){
-  // Group where Az>0 and El>0 (per table heading)
+  // Group where Az>0 and El>0 (per table heading in index.html):contentReference[oaicite:3]{index=3}
   const groups=[];
   let cur=[];
   for (const r of rows){
@@ -205,7 +219,6 @@ function setProgress(pct){
 
 /* ---------- UI: file pickers ---------- */
 function fillFilePickers(){
-  // Fill whichTleFromFile and tlePicker with parsedTLEs
   const selA = byId('whichTleFromFile');
   const selB = byId('tlePicker');
   [selA, selB].forEach(sel=>{
@@ -240,7 +253,7 @@ function renderGroupsTable(){
   tbody.innerHTML = '';
   groupsFlat = []; // reset
 
-  // 1) Build a flat list of all groups with their metadata
+  // flatten all groups
   resultsByTLE.forEach((tleRes, tleIdx) => {
     tleRes.groups.forEach((g, gi) => {
       const s = tleRes.stats[gi];
@@ -259,10 +272,10 @@ function renderGroupsTable(){
     });
   });
 
-  // 2) Sort by start time (ascending)
+  // sort by start time
   groupsFlat.sort((a, b) => new Date(a.start) - new Date(b.start));
 
-  // 3) Render in that order
+  // render
   let counter = 0;
   groupsFlat.forEach(item => {
     const tr = document.createElement('tr');
@@ -304,7 +317,6 @@ function renderGroupsTable(){
   byId('downloadGroupsZipBtn').disabled = totalGroups === 0;
   byId('downloadAllBtn').disabled = !resultsByTLE.some(r => r.allRows.length);
 }
-
 
 /* ---------- Modal ---------- */
 function closeModal(){ byId('groupModal').classList.add('hidden'); $('.modal-backdrop').setAttribute('aria-hidden','true'); }
@@ -357,19 +369,19 @@ function renderGroupModalPage(){
   };
 }
 
-/* ---------- Generate ---------- */
+/* ---------- Generate (UTC) ---------- */
 async function generate(){
   ensureDefaultTimeRange();
 
   const lat = parseFloat(byId('obsLat').value||'0') || 0;
   const lon = parseFloat(byId('obsLon').value||'0') || 0;
-  const alt_km = (parseFloat(byId('obsAltM').value||'0') || 0) / 1000.0;
+  const alt_m = (parseFloat(byId('obsAltM').value||'0') || 0); // meters
 
   const tiltDeg = parseFloat(byId('tiltDeg').value||'0') || 0;
   const tiltAzDeg = parseFloat(byId('tiltAzDeg').value||'0') || 0;
 
-  const startStr = byId('startTime').value;
-  const endStr   = byId('endTime').value;
+  const startStr = byId('startTime').value; // "YYYY-MM-DDTHH:mm"
+  const endStr   = byId('endTime').value;   // "YYYY-MM-DDTHH:mm"
   const stepMs   = parseInt(byId('resolutionMs').value||'1000',10) || 1000;
 
   const doRefract = byId('applyRefraction').checked;
@@ -377,7 +389,7 @@ async function generate(){
 
   const mode = byId('whichTles').value || 'current';
 
-  // Build TLE list based on mode
+  // Build TLE list based on mode (UI is from index.html):contentReference[oaicite:4]{index=4}
   let tleList = [];
   if (mode === 'current'){
     const name = byId('tleName').value.trim();
@@ -399,11 +411,11 @@ async function generate(){
     tleList = parsedTLEs.slice(0,1);
   }
 
-  // Time range
+  // Time range — interpret inputs as **UTC** (append "Z")
   let startDate, endDate;
   if (startStr && endStr){
-    startDate = new Date(startStr);
-    endDate   = new Date(endStr);
+    startDate = new Date(startStr + "Z");
+    endDate   = new Date(endStr   + "Z");
     if (!isFinite(+startDate) || !isFinite(+endDate) || (+endDate <= +startDate)){
       alert('Invalid time range. Ensure Start < End.');
       return;
@@ -420,7 +432,7 @@ async function generate(){
     for (let i=0;i<tleList.length;i++){
       const tle = tleList[i];
       const satrec = satellite.twoline2satrec(tle.l1, tle.l2);
-      const obs = {lat, lon, alt_km, tiltDeg, tiltAzDeg};
+      const obs = {lat, lon, alt_m, tiltDeg, tiltAzDeg};
       const rows = computeTrackForTLE(satrec, startDate, endDate, stepMs, obs, doRefract, tempC);
       const {groups, stats} = groupRows(rows);
       resultsByTLE.push({ name: tle.name, allRows: rows, groups, stats });
