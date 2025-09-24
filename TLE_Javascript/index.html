@@ -1,17 +1,20 @@
 <!doctype html>
 <html lang="en">
+
 <head>
   <meta charset="utf-8" />
   <title>TLE Pass Generator</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link href="styles.css" rel="stylesheet" />
   <!-- Libraries (UMD) -->
-  <script src="https://cdn.jsdelivr.net/npm/satellite.js@6.0.1/dist/satellite.min.js" defer crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/satellite.js@6.0.1/dist/satellite.min.js" defer
+    crossorigin="anonymous"></script>
   <!-- <script src="satellite_5.min.js"  ></script> -->
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer crossorigin="anonymous"></script>
   <!-- App -->
   <script src="app.js" defer></script>
 </head>
+
 <body>
   <div class="container">
     <!-- LEFT: inputs -->
@@ -28,11 +31,13 @@
           <div></div>
           <label class="full">
             Line 1
-            <input id="tleL1" type="text" value="1 44078U 19072A   25237.00127315  .00000014  00000-0  40313-4 0  1239" />
+            <input id="tleL1" type="text"
+              value="1 44078U 19072A   25237.00127315  .00000014  00000-0  40313-4 0  1239" />
           </label>
           <label class="full">
             Line 2
-            <input id="tleL2" type="text" value="2 44078  98.2808 291.9629 0018719  34.1424  38.1671 14.43768520337337" />
+            <input id="tleL2" type="text"
+              value="2 44078  98.2808 291.9629 0018719  34.1424  38.1671 14.43768520337337" />
           </label>
         </div>
 
@@ -68,11 +73,11 @@
         <div class="grid-2">
           <label>
             Start (UTC)
-            <input id="startTime" type="datetime" />
+            <input id="startTime" type="datetime" step="1"/>
           </label>
           <label>
             End (UTC)
-            <input id="endTime" type="datetime" />
+            <input id="endTime" type="datetime" step="1"/>
           </label>
         </div>
         <div class="grid-3">
@@ -114,7 +119,14 @@
               <option value="all">All TLEs from file</option>
             </select>
           </label>
-          <select id="whichTleFromFile" class="hidden" title="Pick a TLE from the loaded file"></select>
+          <label class="rows">
+            TLE:
+            <select id="whichTleFromFile" class="hidden" title="Pick a TLE from the loaded file"></select>
+          </label>
+          <label class="rows">
+            Min El (°)
+            <input id="minElFilter" type="number" step="0.05" value="0.05" min="0" style="width:80px;" />
+          </label>
         </div>
 
         <div class="button-bar">
@@ -171,8 +183,10 @@
       <div class="modal-body">
         <div class="modal-controls">
           <div class="row gap">
+            <button id="modalFirstBtn">⏮ First</button>
             <button id="modalPrevBtn">Prev</button>
             <button id="modalNextBtn">Next</button>
+            <button id="modalLastBtn">Last ⏭</button>
           </div>
           <div id="modalPageInfo" class="muted">Page 0/0 • 0 rows</div>
           <label class="rows">
@@ -203,4 +217,5 @@
     <div class="modal-backdrop" aria-hidden="true"></div>
   </div>
 </body>
+
 </html>
