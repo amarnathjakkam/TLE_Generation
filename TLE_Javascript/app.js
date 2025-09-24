@@ -1,436 +1,508 @@
-/* ======= Constants / Globals ======= */
-const TIMESTAMP_INDEX = 0;
-const AZIMUTH_INDEX   = 1;
-const ELEVATION_INDEX = 2;
+/* =========================
+   TLE Pass Generator – app.js (aligned to index.html)
+   ========================= */
 
-let allResults = [];          // Array<[timeISO, azDegStr, elDegStr>]
-let groupedPasses = [];       // Array<Array<[timeISO, azStr, elStr]>>
-let groupedSummary = [];      // Array<summary objects>
+/* ---------- Constants / Globals ---------- */
+const IDX_T = 0, IDX_AZ = 1, IDX_EL = 2;
 
-const modalState = {
-  groupIndex: -1,
-  page: 1,
-  rowsPerPage: 20
-};
+// Default time range (UTC) — 24-08-2025 02:00 → 25-08-2025 02:00
+const DEFAULT_START_UTC = new Date(Date.UTC(2025, 7, 25, 2, 0, 0));
+const DEFAULT_END_UTC   = new Date(Date.UTC(2025, 7, 26, 2, 0, 0));
 
-/* ======= Helpers: DOM ======= */
-const $ = (sel) => document.querySelector(sel);
+// Built-in fallback TLE (works even if no file is loaded)
+const DEFAULT_TLE_TEXT = `
+ISS (ZARYA)
+1 25544U 98067A   25235.50000000  .00016717  00000-0  10270-3 0  9991
+2 25544  51.6430  90.0000 0004500  75.0000  30.0000 15.50000000  0001
+`.trim();
 
-function setProgress(p) {
-  const wrap = $('#progressWrap');
-  const bar = $('#progressBar');
-  wrap.classList.remove('hidden');
-  wrap.setAttribute('aria-hidden', 'false');
-  bar.style.width = `${Math.max(0, Math.min(100, p))}%`;
-  if (p >= 100) {
-    setTimeout(() => {
-      wrap.classList.add('hidden');
-      wrap.setAttribute('aria-hidden', 'true');
-      bar.style.width = '0%';
-    }, 400);
-  }
+let parsedTLEs = [];          // [{name,l1,l2}]
+let resultsByTLE = [];        // per-TLE results (rows & groups)
+let groupsFlat = [];          // flattened groups for the table & modal navigation
+
+const modalState = { groupKey: null, page: 1, rpp: 20 };
+
+/* ---------- DOM helpers ---------- */
+const $  = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
+const byId = (id) => document.getElementById(id);
+
+function pad2(n){ return String(n).padStart(2,'0'); }
+function pad3(n){ return String(n).padStart(3,'0'); }
+function toRad(d){ return d*Math.PI/180; }
+function toDeg(r){ return r*180/Math.PI; }
+function isoUTC(d){ return new Date(d).toISOString().replace('.000',''); }
+function fixed(n, d=2){ return (Number.isFinite(n)?n:0).toFixed(d); }
+
+function sanitizeName(s){ return (s||'tle').replace(/[^\w\-]+/g,'_').slice(0,80); }
+function escCsv(v){ const s=String(v); return /[",\n]/.test(s)?`"${s.replace(/"/g,'""')}"`:s; }
+function csv(headers, rows){
+  const h=headers.map(escCsv).join(',');
+  const b=rows.map(r=>r.map(escCsv).join(',')).join('\n');
+  return `${h}\n${b}`;
+}
+function downloadBlob(name, blob){
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href=url; a.download=name; document.body.appendChild(a); a.click();
+  URL.revokeObjectURL(url); a.remove();
+}
+function downloadCsv(name, headers, rows){
+  downloadBlob(name, new Blob([csv(headers, rows)],{type:'text/csv'}));
 }
 
-function fmtISO(d) {
-  const z = (n, w=2) => String(n).padStart(w, '0');
-  return `${d.getUTCFullYear()}-${z(d.getUTCMonth()+1)}-${z(d.getUTCDate())} `
-       + `${z(d.getUTCHours())}:${z(d.getUTCMinutes())}:${z(d.getUTCSeconds())}.${z(d.getUTCMilliseconds(),3)}`;
+// datetime-local filler (local naive)
+function setDateTimeLocal(id, date){
+  const el = byId(id); if (!el) return;
+  const dt = new Date(date);
+  const y = dt.getFullYear(), m = pad2(dt.getMonth()+1), d=pad2(dt.getDate());
+  const H = pad2(dt.getHours()), M = pad2(dt.getMinutes());
+  el.value = `${y}-${m}-${d}T${H}:${M}`;
 }
-const toRadians = (d) => d * Math.PI / 180;
-const toDegrees = (r) => r * 180 / Math.PI;
-
-/* ======= Ensure libraries (fallback ESM) ======= */
-async function ensureSatelliteLoaded() {
-  if (typeof window.satellite === 'undefined') {
-    const mod = await import('https://cdn.jsdelivr.net/npm/satellite.js@6.0.1/+esm');
-    window.satellite = mod;
-  }
-}
-async function ensureJSZipLoaded() {
-  if (typeof window.JSZip === 'undefined') {
-    const mod = await import('https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm');
-    window.JSZip = mod.default || mod;
-  }
+function ensureDefaultTimeRange(){
+  if (!byId('startTime').value) setDateTimeLocal('startTime', DEFAULT_START_UTC);
+  if (!byId('endTime').value)   setDateTimeLocal('endTime',   DEFAULT_END_UTC);
 }
 
-/* ======= Refraction & Pressure ======= */
-function pressureMbarFromAltMeters(h_m) {
-  return 1013.25 * Math.pow(1 - 2.25577e-5 * h_m, 5.25588);
-}
-function refractElevationDeg(elDeg, pressure_mbar, temp_c) {
-  if (elDeg <= -1) return elDeg;
-  const T_k = 273.15 + temp_c;
-  const R_arcmin = 1.02 / Math.tan(toRadians(elDeg + 10.3 / (elDeg + 5.11)));
-  const scale = (pressure_mbar / 1010.0) * (283.0 / T_k);
-  return elDeg + (R_arcmin * scale) / 60.0;
+/* ---------- Atmosphere helpers ---------- */
+function pressure_mbar_from_alt_km(alt_km){
+  const h = Math.max(0, alt_km*1000);
+  const p0=1013.25, T0=288.15, L=0.0065, g=9.80665, R=287.053;
+  if (h<=11000) return p0*Math.pow(1-(L*h)/T0, g/(R*L));
+  const p11=p0*Math.pow(1-(L*11000)/T0, g/(R*L));
+  const T11=T0-L*11000;
+  return p11*Math.exp(-(g/(R*T11))*(h-11000));
 }
 
-/* ======= Tilt correction ======= */
-function applyTilt(azDeg, elDeg, tiltDeg, tiltAzDeg) {
-  if (!tiltDeg) return [azDeg, elDeg];
+// Saemundsson refraction (deg) approx; el in deg, P in mbar, T in °C
+function refraction_deg(elDeg, Pmbar, TdegC){
+  // below horizon we skip
+  if (elDeg <= 0) return 0;
+  const e = toRad(elDeg);
+  const R_arcmin = (1.02 / Math.tan(e + 10.3/(e + 5.11))) * (Pmbar/1010) * (283/(273+TdegC));
+  return R_arcmin / 60.0;
+}
 
-  const az = toRadians(azDeg);
-  const el = toRadians(elDeg);
-  const t  = toRadians(tiltDeg);
-  const tz = toRadians(tiltAzDeg);
+/* ---------- Tilt correction ---------- */
+function applyTilt(azDeg, elDeg, tiltDeg, tiltAzDeg){
+  if (!tiltDeg || Math.abs(tiltDeg) < 1e-9) return {az:azDeg, el:elDeg};
+  const az = toRad(azDeg), el = toRad(elDeg);
+  const t  = toRad(tiltDeg), tz = toRad(tiltAzDeg||0);
 
   const E = Math.cos(el) * Math.sin(az);
   const N = Math.cos(el) * Math.cos(az);
   const U = Math.sin(el);
-  const v = [E, N, U];
+  const v = [E,N,U];
 
-  // Axis k = u × d, with u=[0,0,1], d=[sin tz, cos tz, 0] => k=[-cos tz, sin tz, 0]
+  // axis in horizontal plane perpendicular to desired downwards tilt dir
   const k = [-Math.cos(tz), Math.sin(tz), 0];
-
-  const ct = Math.cos(-t), st = Math.sin(-t);
-  const kx = k[0], ky = k[1], kz = k[2];
-  const cross = [
-    ky * v[2] - kz * v[1],
-    kz * v[0] - kx * v[2],
-    kx * v[1] - ky * v[0]
+  const ct=Math.cos(-t), st=Math.sin(-t);
+  const cross=[ k[1]*v[2]-k[2]*v[1], k[2]*v[0]-k[0]*v[2], k[0]*v[1]-k[1]*v[0] ];
+  const dot = k[0]*v[0]+k[1]*v[1]+k[2]*v[2];
+  const v2=[
+    v[0]*ct + cross[0]*st + k[0]*dot*(1-ct),
+    v[1]*ct + cross[1]*st + k[1]*dot*(1-ct),
+    v[2]*ct + cross[2]*st + k[2]*dot*(1-ct)
   ];
-  const dot = kx * v[0] + ky * v[1] + kz * v[2];
-  const vPrime = [
-    v[0] * ct + cross[0] * st + kx * dot * (1 - ct),
-    v[1] * ct + cross[1] * st + ky * dot * (1 - ct),
-    v[2] * ct + cross[2] * st + kz * dot * (1 - ct)
-  ];
-
-  const E2 = vPrime[0], N2 = vPrime[1], U2 = vPrime[2];
-  let az2 = toDegrees(Math.atan2(E2, N2));
-  if (az2 < 0) az2 += 360;
-  const el2 = toDegrees(Math.asin(Math.max(-1, Math.min(1, U2))));
-  return [az2, el2];
+  const el2 = toDeg(Math.asin(Math.max(-1,Math.min(1,v2[2]))));
+  const az2 = (toDeg(Math.atan2(v2[0], v2[1])) + 360) % 360;
+  return {az: az2, el: el2};
 }
 
-/* ======= CSV / ZIP helpers ======= */
-function toCsv(headers, rows) {
-  const esc = (s) => {
-    const t = String(s ?? '');
-    return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
-  };
-  const head = headers.map(esc).join(',');
-  const body = rows.map(r => r.map(esc).join(',')).join('\n');
-  return head + '\n' + body;
-}
-function downloadBlob(filename, blob) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  URL.revokeObjectURL(url);
-  a.remove();
-}
-function downloadCsv(filename, headers, rows) {
-  const csv = toCsv(headers, rows);
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  downloadBlob(filename, blob);
-}
-
-/* ======= Grouping ======= */
-function groupPositiveAzEl(rows) {
-  const groups = [];
-  let cur = [];
-  for (const r of rows) {
-    const az = parseFloat(r[AZIMUTH_INDEX]);
-    const el = parseFloat(r[ELEVATION_INDEX]);
-    if (az > 0 && el > 0) {
-      cur.push(r);
-    } else if (cur.length) {
-      groups.push(cur);
-      cur = [];
-    }
+/* ---------- TLE parsing & fallback ---------- */
+function parseTLEText(text){
+  const lines = (text||'').split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  const out=[];
+  for (let i=0;i<lines.length;){
+    if (/^1\s*\d{5}/.test(lines[i]) && i+1<lines.length && /^2\s*\d{5}/.test(lines[i+1])){
+      out.push({name:`TLE_${out.length+1}`, l1:lines[i], l2:lines[i+1]}); i+=2;
+    } else if (i+2<lines.length && /^1\s*\d{5}/.test(lines[i+1]) && /^2\s*\d{5}/.test(lines[i+2])){
+      out.push({name:lines[i]||`TLE_${out.length+1}`, l1:lines[i+1], l2:lines[i+2]}); i+=3;
+    } else { i+=1; }
   }
-  if (cur.length) groups.push(cur);
-  return groups;
+  return out;
+}
+function loadDefaultTLEIfEmpty(){
+  if (parsedTLEs.length) return;
+  parsedTLEs = parseTLEText(DEFAULT_TLE_TEXT);
+  fillFilePickers();
+  fillTlePickerToFields();
 }
 
-function summarizeGroups(groups) {
-  return groups.map((g, idx) => {
-    const start = g[0];
-    const end   = g[g.length - 1];
+/* ---------- Compute track ---------- */
+function computeTrackForTLE(satrec, startDate, endDate, stepMs, obs, doRefract, tempC){
+  const rows=[];
+  const start=+startDate, end=+endDate, step=Math.max(100, stepMs|0);
+  const P = pressure_mbar_from_alt_km(obs.alt_km);
 
-    let minEl = +g[0][ELEVATION_INDEX];
-    let maxEl = +g[0][ELEVATION_INDEX];
-    for (const row of g) {
-      const el = +row[ELEVATION_INDEX];
-      if (el < minEl) minEl = el;
-      if (el > maxEl) maxEl = el;
-    }
-
-    const d = decimals();
-    return {
-      idx,
-      startTime: start[TIMESTAMP_INDEX],
-      endTime: end[TIMESTAMP_INDEX],
-      minEl: minEl.toFixed(d),
-      maxEl: maxEl.toFixed(d),
-      startAz: (+start[AZIMUTH_INDEX]).toFixed(d),
-      endAz: (+end[AZIMUTH_INDEX]).toFixed(d),
-      count: g.length
-    };
-  });
-}
-
-function renderGroupSummary(summary) {
-  const table = $('#groupTable');
-  const tbody = table.querySelector('tbody');
-  const emptyMsg = $('#noGroupsMsg');
-  const countLabel = $('#groupCountLabel');
-  tbody.innerHTML = '';
-
-  summary.forEach((s, i) => {
-    const tr = document.createElement('tr');
-    const c = (text) => { const td = document.createElement('td'); td.textContent = text; return td; };
-    tr.appendChild(c(i + 1));
-    tr.appendChild(c(s.startTime));
-    tr.appendChild(c(s.endTime));
-    tr.appendChild(c(s.minEl));
-    tr.appendChild(c(s.maxEl));
-    tr.appendChild(c(s.startAz));
-    tr.appendChild(c(s.endAz));
-    tr.appendChild(c(s.count));
-
-    const actionTd = document.createElement('td');
-    const viewBtn = document.createElement('button');
-    viewBtn.textContent = 'View';
-    viewBtn.addEventListener('click', () => showGroupDetails(s.idx));
-    actionTd.appendChild(viewBtn);
-    tr.appendChild(actionTd);
-
-    tbody.appendChild(tr);
-  });
-
-  const has = summary.length > 0;
-  table.classList.toggle('hidden', !has);
-  emptyMsg.classList.toggle('hidden', has);
-  countLabel.textContent = has ? `${summary.length} group(s)` : '';
-  $('#downloadGroupsZipBtn').disabled = !has;
-}
-
-/* ======= Modal (pagination inside modal) ======= */
-function renderGroupModalPage() {
-  const g = groupedPasses[modalState.groupIndex] || [];
-  const total = g.length;
-  const pages = Math.max(1, Math.ceil(total / modalState.rowsPerPage));
-  modalState.page = Math.max(1, Math.min(modalState.page, pages));
-
-  const startIdx = (modalState.page - 1) * modalState.rowsPerPage;
-  const endIdx = Math.min(total, startIdx + modalState.rowsPerPage);
-  const slice = g.slice(startIdx, endIdx);
-
-  const tbody = $('#groupDetailsTable tbody');
-  tbody.innerHTML = '';
-  for (const r of slice) {
-    const tr = document.createElement('tr');
-    const tdT = document.createElement('td'); tdT.textContent = r[TIMESTAMP_INDEX];
-    const tdA = document.createElement('td'); tdA.textContent = r[AZIMUTH_INDEX];
-    const tdE = document.createElement('td'); tdE.textContent = r[ELEVATION_INDEX];
-    tr.appendChild(tdT); tr.appendChild(tdA); tr.appendChild(tdE);
-    tbody.appendChild(tr);
-  }
-
-  $('#modalPageInfo').textContent = `Page ${modalState.page}/${pages} • ${total} rows`;
-  $('#modalPrevBtn').disabled = modalState.page <= 1;
-  $('#modalNextBtn').disabled = modalState.page >= pages;
-}
-
-function showGroupDetails(groupIndex) {
-  modalState.groupIndex = groupIndex;
-  modalState.page = 1;
-
-  const g = groupedPasses[groupIndex] || [];
-  $('#groupTitle').textContent = `Group #${groupIndex + 1} — ${g.length} samples`;
-
-  renderGroupModalPage();
-
-  // CSV for entire group
-  $('#downloadGroupCsv').onclick = () => {
-    downloadCsv(`group_${String(groupIndex + 1).padStart(2,'0')}.csv`,
-      ['time_utc','az_deg','el_deg'],
-      g
-    );
-  };
-
-  const modal = $('#groupModal');
-  modal.classList.remove('hidden');
-  modal.setAttribute('aria-hidden', 'false');
-}
-
-(function wireModalControls(){
-  // Rows per page selector
-  $('#modalRowsPerPage').addEventListener('change', (e) => {
-    modalState.rowsPerPage = parseInt(e.target.value, 10) || 20;
-    renderGroupModalPage();
-  });
-  // Prev/Next
-  $('#modalPrevBtn').addEventListener('click', () => {
-    modalState.page -= 1;
-    renderGroupModalPage();
-  });
-  $('#modalNextBtn').addEventListener('click', () => {
-    modalState.page += 1;
-    renderGroupModalPage();
-  });
-
-  // Close only on close button or backdrop
-  const modal = $('#groupModal');
-  const closeBtn = $('#closeModal');
-  const backdrop = modal ? modal.querySelector('.modal-backdrop') : null;
-  const content = modal ? modal.querySelector('.modal-content') : null;
-
-  const close = () => {
-    modal.classList.add('hidden');
-    modal.setAttribute('aria-hidden', 'true');
-  };
-
-  if (closeBtn) closeBtn.addEventListener('click', close);
-  if (backdrop) backdrop.addEventListener('click', close);
-
-  // Ensure clicks inside modal do NOT close (extra safety)
-  if (content) content.addEventListener('click', (e) => e.stopPropagation());
-})();
-
-/* ======= UI getters ======= */
-function decimals() { return Math.max(0, Math.min(6, parseInt($('#decimals').value || '0', 10))); }
-
-/* ======= Resolution (ms, forced to multiples of 100 ms) ======= */
-function readStepMs() {
-  let v = parseInt($('#resolutionMs')?.value || '100', 10);
-  if (isNaN(v)) v = 100;
-  v = Math.max(100, Math.round(v / 100) * 100); // multiple of 100ms
-  if ($('#resolutionMs')) $('#resolutionMs').value = v; // normalize UI display
-  return v;
-}
-
-/* ======= ZIP: all groups ======= */
-async function downloadGroupsZip() {
-  if (!groupedPasses.length) return;
-  await ensureJSZipLoaded();
-  const zip = new JSZip();
-
-  // 1) One CSV per group
-  const headers = ['time_utc','az_deg','el_deg'];
-  groupedPasses.forEach((g, i) => {
-    const csv = toCsv(headers, g);
-    zip.file(`group_${String(i+1).padStart(2,'0')}.csv`, csv);
-  });
-
-  // 2) Add a summary CSV
-  const summaryHeaders = ['group_index','start_utc','end_utc','min_el_deg','max_el_deg','start_az_deg','end_az_deg','samples'];
-  const summaryRows = groupedSummary.map(s => [
-    s.idx + 1, s.startTime, s.endTime, s.minEl, s.maxEl, s.startAz, s.endAz, s.count
-  ]);
-  zip.file('groups_summary.csv', toCsv(summaryHeaders, summaryRows));
-
-  const blob = await zip.generateAsync({ type: 'blob' });
-  downloadBlob('groups.zip', blob);
-}
-
-/* ======= Main compute ======= */
-async function generate() {
-  await ensureSatelliteLoaded();
-
-  const l1 = $('#tleL1').value.trim();
-  const l2 = $('#tleL2').value.trim();
-
-  const latDeg = parseFloat($('#obsLat').value);
-  const lonDeg = parseFloat($('#obsLon').value);
-  const altM   = parseFloat($('#obsAltM').value);
-  const altKm  = altM / 1000.0;
-
-  const startLocal = $('#startTime').value;
-  const endLocal   = $('#endTime').value;
-  if (!startLocal || !endLocal) {
-    alert('Please set start and end times.');
-    return;
-  }
-  const start = new Date(startLocal);
-  const end   = new Date(endLocal);
-  if (isNaN(start) || isNaN(end) || end <= start) {
-    alert('Invalid time range.');
-    return;
-  }
-
-  // Sampling in milliseconds (multiples of 100 ms)
-  const stepMs = readStepMs();
-  const nSteps = Math.floor((end - start) / stepMs) + 1;
-
-  const applyRef = $('#applyRefraction').checked;
-  const tempC    = parseFloat($('#tempC').value);
-  const pressure = pressureMbarFromAltMeters(altM);
-
-  const tiltDeg  = parseFloat($('#tiltDeg').value) || 0;
-  const tiltAz   = parseFloat($('#tiltAzDeg').value) || 0;
-
-  // Prepare propagator
-  const satrec = satellite.twoline2satrec(l1, l2);
-  const observerGd = {
-    longitude: toRadians(lonDeg),
-    latitude: toRadians(latDeg),
-    height: altKm
-  };
-
-  allResults = [];
-  setProgress(0);
-
-  // Update progress roughly every ~2 seconds worth of samples
-  const chunk = Math.max(100, Math.floor(20000 / stepMs));
-  for (let i = 0; i < nSteps; i += 1) {
-    const t = new Date(start.getTime() + i * stepMs);
-
-    const pv = satellite.propagate(satrec, t);
+  for (let t=start; t<=end; t+=step){
+    const dt = new Date(t);
+    const gmst = satellite.gstime(dt);
+    const pv = satellite.propagate(satrec, dt);
     if (!pv.position) continue;
 
-    const gmst = satellite.gstime(t);
-    const positionEcf = satellite.eciToEcf(pv.position, gmst);
+    const observerGd = { longitude: toRad(obs.lon), latitude: toRad(obs.lat), height: obs.alt_km };
+    const look = satellite.ecfToLookAngles(observerGd, satellite.eciToEcf(pv.position, gmst));
 
-    const look = satellite.ecfToLookAngles(observerGd, positionEcf);
-    let azDeg = (toDegrees(look.azimuth) + 360) % 360;
-    let elDeg = toDegrees(look.elevation);
+    let az = (toDeg(look.azimuth)+360)%360;
+    let el = toDeg(look.elevation);
 
-    [azDeg, elDeg] = applyTilt(azDeg, elDeg, tiltDeg, tiltAz);
-    if (applyRef) elDeg = refractElevationDeg(elDeg, pressure, tempC);
-
-    allResults.push([fmtISO(t), azDeg.toFixed(decimals()), elDeg.toFixed(decimals())]);
-
-    if ((i % chunk) === 0 || i === nSteps - 1) {
-      setProgress(Math.floor((i + 1) * 100 / nSteps));
-      await new Promise(requestAnimationFrame);
+    if (obs.tiltDeg){
+      const c = applyTilt(az, el, obs.tiltDeg, obs.tiltAzDeg||0);
+      az = c.az; el = c.el;
     }
+    if (doRefract){
+      el += refraction_deg(el, P, tempC);
+    }
+
+    rows.push([isoUTC(dt), Number(az.toFixed(2)), Number(el.toFixed(2))]);
   }
-
-  // Enable all-CSV download
-  $('#downloadAllBtn').disabled = allResults.length === 0;
-  $('#downloadAllBtn').onclick = () => {
-    if (!allResults.length) return;
-    downloadCsv('all_results.csv', ['time_utc','az_deg','el_deg'], allResults);
-  };
-
-  // Grouping → Summary
-  groupedPasses  = groupPositiveAzEl(allResults);
-  groupedSummary = summarizeGroups(groupedPasses);
-  renderGroupSummary(groupedSummary);
+  return rows;
 }
 
-/* ======= Wire UI ======= */
-window.addEventListener('DOMContentLoaded', () => {
-  // Defaults for datetime-local (now .. +15 min)
-  const now = new Date();
-  const round = (ms, step) => new Date(Math.ceil(ms / step) * step);
-  const step = 60_000; // to minutes
-  const start = round(now.getTime(), step);
-  const end = new Date(start.getTime() + 15 * 60_000);
+/* ---------- Grouping & stats ---------- */
+function groupRows(rows){
+  // Group where Az>0 and El>0 (per table heading)
+  const groups=[];
+  let cur=[];
+  for (const r of rows){
+    const az=r[IDX_AZ], el=r[IDX_EL];
+    if (az>0 && el>0) cur.push(r);
+    else { if (cur.length){ groups.push(cur); cur=[]; } }
+  }
+  if (cur.length) groups.push(cur);
 
-  const fmtLocal = (d) => {
-    const z = (n, w=2) => String(n).padStart(w, '0');
-    return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}T${z(d.getHours())}:${z(d.getMinutes())}`;
+  const stats = groups.map(g=>{
+    let minEl=  90, maxEl=-90;
+    let startAz=g[0][IDX_AZ], endAz=g[g.length-1][IDX_AZ];
+    for (const r of g){ if (r[IDX_EL]<minEl) minEl=r[IDX_EL]; if (r[IDX_EL]>maxEl) maxEl=r[IDX_EL]; }
+    return {
+      start: g[0][IDX_T],
+      end  : g[g.length-1][IDX_T],
+      minEl: Number(minEl.toFixed(2)),
+      maxEl: Number(maxEl.toFixed(2)),
+      startAz: Number(startAz.toFixed(2)),
+      endAz  : Number(endAz.toFixed(2)),
+      samples: g.length
+    };
+  });
+  return {groups, stats};
+}
+
+/* ---------- UI: progress ---------- */
+function setBusy(b){
+  const pb = byId('progressBar'), wrap = byId('progressWrap');
+  byId('generateBtn').disabled = b;
+  if (wrap) wrap.classList.toggle('hidden', !b);
+  if (pb){ pb.style.width = b? '30%' : '0%'; pb.setAttribute('aria-valuenow', b? '30' : '0'); }
+}
+function setProgress(pct){
+  const pb = byId('progressBar');
+  if (!pb) return;
+  const c = Math.max(0, Math.min(100, pct|0));
+  pb.style.width = `${c}%`; pb.setAttribute('aria-valuenow', `${c}`);
+}
+
+/* ---------- UI: file pickers ---------- */
+function fillFilePickers(){
+  // Fill whichTleFromFile and tlePicker with parsedTLEs
+  const selA = byId('whichTleFromFile');
+  const selB = byId('tlePicker');
+  [selA, selB].forEach(sel=>{
+    if (!sel) return;
+    sel.innerHTML='';
+    parsedTLEs.forEach((t,i)=>{
+      const o=document.createElement('option');
+      o.value=String(i); o.textContent=t.name; sel.appendChild(o);
+    });
+    sel.classList.toggle('hidden', parsedTLEs.length===0);
+  });
+}
+function fillTlePickerToFields(){
+  const sel = byId('tlePicker');
+  if (!sel) return;
+  sel.onchange = ()=>{
+    const idx = parseInt(sel.value, 10);
+    const t = parsedTLEs[idx];
+    if (t){
+      byId('tleName').value = t.name;
+      byId('tleL1').value = t.l1;
+      byId('tleL2').value = t.l2;
+    }
   };
-  $('#startTime').value = fmtLocal(start);
-  $('#endTime').value   = fmtLocal(end);
+}
+function renderGroupsTable(){
+  const tbody = $('#groupTable tbody');
+  const table = byId('groupTable');
+  const lbl   = byId('groupCountLabel');
+  const noMsg = byId('noGroupsMsg');
 
-  $('#generateBtn').addEventListener('click', generate);
-  $('#downloadGroupsZipBtn').addEventListener('click', downloadGroupsZip);
+  tbody.innerHTML = '';
+  groupsFlat = []; // reset
+
+  // 1) Build a flat list of all groups with their metadata
+  resultsByTLE.forEach((tleRes, tleIdx) => {
+    tleRes.groups.forEach((g, gi) => {
+      const s = tleRes.stats[gi];
+      groupsFlat.push({
+        tleIdx,
+        gi,
+        tleName: tleRes.name,
+        start: s.start,
+        end: s.end,
+        minEl: s.minEl,
+        maxEl: s.maxEl,
+        startAz: s.startAz,
+        endAz: s.endAz,
+        samples: s.samples,
+      });
+    });
+  });
+
+  // 2) Sort by start time (ascending)
+  groupsFlat.sort((a, b) => new Date(a.start) - new Date(b.start));
+
+  // 3) Render in that order
+  let counter = 0;
+  groupsFlat.forEach(item => {
+    const tr = document.createElement('tr');
+
+    const openBtn = document.createElement('button');
+    openBtn.textContent = 'Open';
+    const groupKey = `${item.tleIdx}:${item.gi}`;
+    openBtn.addEventListener('click', () => openGroupModal(groupKey));
+
+    const cells = [
+      ++counter,
+      item.tleName,
+      item.start,
+      item.end,
+      fixed(item.minEl, 2),
+      fixed(item.maxEl, 2),
+      fixed(item.startAz, 2),
+      fixed(item.endAz, 2),
+      item.samples
+    ];
+    cells.forEach(val => {
+      const td = document.createElement('td');
+      td.textContent = val;
+      tr.appendChild(td);
+    });
+
+    const tdAct = document.createElement('td');
+    tdAct.appendChild(openBtn);
+    tr.appendChild(tdAct);
+
+    tbody.appendChild(tr);
+  });
+
+  const totalGroups = groupsFlat.length;
+  table.classList.toggle('hidden', totalGroups === 0);
+  noMsg.classList.toggle('hidden', totalGroups !== 0);
+  lbl.textContent = `${totalGroups} group(s)`;
+
+  byId('downloadGroupsZipBtn').disabled = totalGroups === 0;
+  byId('downloadAllBtn').disabled = !resultsByTLE.some(r => r.allRows.length);
+}
+
+
+/* ---------- Modal ---------- */
+function closeModal(){ byId('groupModal').classList.add('hidden'); $('.modal-backdrop').setAttribute('aria-hidden','true'); }
+function openModal(){ byId('groupModal').classList.remove('hidden'); $('.modal-backdrop').setAttribute('aria-hidden','false'); }
+
+function openGroupModal(groupKey){
+  modalState.groupKey = groupKey;
+  modalState.page = 1;
+  renderGroupModalPage();
+  openModal();
+}
+
+function renderGroupModalPage(){
+  if (!modalState.groupKey) return;
+  const [tleIdxStr, giStr] = modalState.groupKey.split(':');
+  const tleIdx = parseInt(tleIdxStr,10), gi = parseInt(giStr,10);
+  const r = resultsByTLE[tleIdx];
+  const g = r?.groups?.[gi] || [];
+  const title = byId('groupTitle');
+  title.textContent = `${r?.name || 'TLE'} — Group ${gi+1} (${g.length} rows)`;
+
+  const rppSel = byId('modalRowsPerPage');
+  const rpp = parseInt(rppSel?.value || modalState.rpp, 10) || 20;
+  modalState.rpp = rpp;
+
+  const totalPages = Math.max(1, Math.ceil(g.length / rpp));
+  modalState.page = Math.max(1, Math.min(modalState.page, totalPages));
+
+  const start = (modalState.page-1)*rpp;
+  const pageRows = g.slice(start, start+rpp);
+
+  const tbody = $('#groupDetailsTable tbody');
+  tbody.innerHTML='';
+  pageRows.forEach(row=>{
+    const tr=document.createElement('tr');
+    [row[IDX_T], fixed(row[IDX_AZ],2), fixed(row[IDX_EL],2)].forEach(v=>{
+      const td=document.createElement('td'); td.textContent=v; tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+
+  byId('modalPageInfo').textContent = `Page ${modalState.page}/${totalPages} • ${g.length} rows`;
+  byId('modalPrevBtn').disabled = modalState.page<=1;
+  byId('modalNextBtn').disabled = modalState.page>=totalPages;
+
+  // Download current group CSV
+  byId('downloadGroupCsv').onclick = ()=>{
+    const name = `${sanitizeName(r?.name||'TLE')}__group_${String(gi+1).padStart(2,'0')}.csv`;
+    downloadCsv(name, ['time_utc','az_deg','el_deg'], g);
+  };
+}
+
+/* ---------- Generate ---------- */
+async function generate(){
+  ensureDefaultTimeRange();
+
+  const lat = parseFloat(byId('obsLat').value||'0') || 0;
+  const lon = parseFloat(byId('obsLon').value||'0') || 0;
+  const alt_km = (parseFloat(byId('obsAltM').value||'0') || 0) / 1000.0;
+
+  const tiltDeg = parseFloat(byId('tiltDeg').value||'0') || 0;
+  const tiltAzDeg = parseFloat(byId('tiltAzDeg').value||'0') || 0;
+
+  const startStr = byId('startTime').value;
+  const endStr   = byId('endTime').value;
+  const stepMs   = parseInt(byId('resolutionMs').value||'1000',10) || 1000;
+
+  const doRefract = byId('applyRefraction').checked;
+  const tempC = parseFloat(byId('tempC').value||'15') || 15;
+
+  const mode = byId('whichTles').value || 'current';
+
+  // Build TLE list based on mode
+  let tleList = [];
+  if (mode === 'current'){
+    const name = byId('tleName').value.trim();
+    const l1   = byId('tleL1').value.trim();
+    const l2   = byId('tleL2').value.trim();
+    if (name && l1 && l2) tleList.push({name, l1, l2});
+  } else if (mode === 'specific'){
+    if (parsedTLEs.length){
+      const idx = parseInt(byId('whichTleFromFile').value || '0', 10) || 0;
+      if (parsedTLEs[idx]) tleList.push(parsedTLEs[idx]);
+    }
+  } else { // all
+    tleList = parsedTLEs.slice();
+  }
+
+  // Fallback if empty
+  if (!tleList.length){
+    loadDefaultTLEIfEmpty();
+    tleList = parsedTLEs.slice(0,1);
+  }
+
+  // Time range
+  let startDate, endDate;
+  if (startStr && endStr){
+    startDate = new Date(startStr);
+    endDate   = new Date(endStr);
+    if (!isFinite(+startDate) || !isFinite(+endDate) || (+endDate <= +startDate)){
+      alert('Invalid time range. Ensure Start < End.');
+      return;
+    }
+  } else {
+    startDate = new Date(DEFAULT_START_UTC);
+    endDate   = new Date(DEFAULT_END_UTC);
+  }
+
+  // Compute
+  resultsByTLE = [];
+  setBusy(true); setProgress(5);
+  try{
+    for (let i=0;i<tleList.length;i++){
+      const tle = tleList[i];
+      const satrec = satellite.twoline2satrec(tle.l1, tle.l2);
+      const obs = {lat, lon, alt_km, tiltDeg, tiltAzDeg};
+      const rows = computeTrackForTLE(satrec, startDate, endDate, stepMs, obs, doRefract, tempC);
+      const {groups, stats} = groupRows(rows);
+      resultsByTLE.push({ name: tle.name, allRows: rows, groups, stats });
+      setProgress(5 + Math.round(((i+1)/tleList.length)*80));
+    }
+    renderGroupsTable();
+    setProgress(100);
+  } catch(e){
+    console.error(e);
+    alert('Generation failed. See console for details.');
+  } finally {
+    setTimeout(()=>{ setBusy(false); setProgress(0); }, 600);
+  }
+}
+
+/* ---------- File handling ---------- */
+async function handleTleFile(file){
+  if (!file){ loadDefaultTLEIfEmpty(); return; }
+  try{
+    const text = await file.text();
+    parsedTLEs = parseTLEText(text);
+    if (!parsedTLEs.length){ loadDefaultTLEIfEmpty(); }
+    fillFilePickers();
+    fillTlePickerToFields();
+  }catch(e){
+    console.warn('TLE read failed, using fallback', e);
+    parsedTLEs=[]; loadDefaultTLEIfEmpty();
+  }
+}
+
+/* ---------- Downloads (All/Groups ZIP) ---------- */
+function setupDownloads(){
+  byId('downloadAllBtn').addEventListener('click', ()=>{
+    const any = resultsByTLE.some(r=>r.allRows.length);
+    if (!any) return;
+    const rows=[];
+    resultsByTLE.forEach(r=>{
+      r.allRows.forEach(a=>rows.push([r.name, ...a]));
+    });
+    downloadCsv('all_results_combined.csv', ['tle','time_utc','az_deg','el_deg'], rows);
+  });
+
+  byId('downloadGroupsZipBtn').addEventListener('click', async ()=>{
+    const has = resultsByTLE.some(r=>r.groups.length);
+    if (!has) return;
+    const zip = new JSZip();
+    resultsByTLE.forEach(r=>{
+      r.groups.forEach((g, gi)=>{
+        const name = `${sanitizeName(r.name)}__group_${String(gi+1).padStart(2,'0')}.csv`;
+        zip.file(name, csv(['time_utc','az_deg','el_deg'], g));
+      });
+    });
+    const blob = await zip.generateAsync({type:'blob'});
+    downloadBlob('groups.zip', blob);
+  });
+}
+
+/* ---------- Wiring ---------- */
+document.addEventListener('DOMContentLoaded', ()=>{
+  // Default times & demo TLE (so it works without a file)
+  ensureDefaultTimeRange();
+  loadDefaultTLEIfEmpty();
+
+  // Generate
+  byId('generateBtn').addEventListener('click', generate);
+
+  // File load
+  const file = byId('tleFile');
+  byId('loadTleBtn').addEventListener('click', ()=> handleTleFile(file.files?.[0]));
+  file.addEventListener('change', ()=> handleTleFile(file.files?.[0]));
+
+  // Pickers
+  fillFilePickers();
+  fillTlePickerToFields();
+
+  // Modal controls
+  byId('closeModal').addEventListener('click', closeModal);
+  $('.modal-backdrop').addEventListener('click', closeModal);
+  byId('modalPrevBtn').addEventListener('click', ()=>{ modalState.page--; renderGroupModalPage(); });
+  byId('modalNextBtn').addEventListener('click', ()=>{ modalState.page++; renderGroupModalPage(); });
+  byId('modalRowsPerPage').addEventListener('change', ()=>{ modalState.page=1; renderGroupModalPage(); });
+
+  // Downloads
+  setupDownloads();
 });
