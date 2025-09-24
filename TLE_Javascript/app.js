@@ -147,6 +147,31 @@ function loadDefaultTLEIfEmpty() {
 }
 
 /* ---------- Space-CSV helpers (HH MM SS.zzz  Az EL) ---------- */
+function formatDateDDMMMYYYYUTC(d = new Date()) { 
+  const day = pad2(d.getUTCDate());
+  const MONS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+  const mon = MONS[d.getUTCMonth()];
+  const y = d.getUTCFullYear();
+  return `${day}${mon}${y}`;  // e.g., "25AUG2025"
+}
+function schedFmtDateFromISO(d = new Date()) { 
+  const dd = pad2(d.getUTCDate());
+  const mm = pad2(d.getUTCMonth()+1);
+  const yyyy = pad2(d.getUTCFullYear());
+  const HH = pad2(d.getUTCHours());
+  const MM = pad2(d.getUTCMinutes());
+  const SS = pad2(d.getUTCSeconds());
+  return `${dd}${mm}${yyyy}${HH}${MM}${SS}`;
+}
+
+function schedFmtHMSmsFromISO(isoUtc) {
+  const d = new Date(isoUtc);
+  const HH = pad2(d.getUTCHours());
+  const MM = pad2(d.getUTCMinutes());
+  const SS = pad2(d.getUTCSeconds());
+  return `${HH}${MM}${SS}`;
+}
+
 function fmtHMSmsFromISO(isoUtc) {
   const d = new Date(isoUtc);
   const HH = pad2(d.getUTCHours());
@@ -166,7 +191,7 @@ function fmtFixedSigned(value, intDigits, fracDigits) {
 function fmtAz(az) { return fmtFixedSigned(az, 3, getDecimalCount()); } // XXX.XX
 function fmtEl(el) { return fmtFixedSigned(el, 2, getDecimalCount()); } // XX.XX
 function buildHMSCsvLines(rows) {
-  const lines = ['HH MM SS.zzz  Az EL'];
+  const lines = []; //['HH MM SS.zzz  Az EL'];
   for (const r of rows) {
     const t = fmtHMSmsFromISO(r[0]);
     const a = fmtAz(r[1]);
@@ -575,15 +600,31 @@ function setupDownloads() {
     const has = resultsByTLE.some(r => r.groups.length);
     if (!has) return;
     const zip = new JSZip();
+    let passIndex = 0;
+    let schedFileContenets = `HYD${schedFmtDateFromISO()}000$$$$$$$$$$$\r\n`;
     resultsByTLE.forEach(r => {
       r.groups.forEach((g, gi) => {
         const firstIso = g[0][IDX_T];     // group's first angle timestamp (ISO UTC)
+        const lastIso = g[g.length-1][IDX_T];     // group's first angle timestamp (ISO UTC)
+
+        ++passIndex;
+        let timseRangeStr = schedFmtHMSmsFromISO(firstIso) + schedFmtHMSmsFromISO(lastIso);
+        schedFileContenets = schedFileContenets + String(passIndex).padStart(3, '0') 
+                  + sanitizeName(r.name) 
+                  + String(gi).padStart(6, '0') //need to check
+                  + timseRangeStr
+                  + String(0).padStart(4, '0') //need to check
+                  + `$$$$$$$$$$$$$$$$$$$$000000${timseRangeStr}0000000000000$$$$$$$$$$$$$$$$$A00C00D00000$$$$\r\n`;
+
         const doy = dayOfYearUTC(firstIso);
         const name = `pts${String(gi).padStart(5, '0')}_${sanitizeName(r.name)}_${byId('antennaId').value}.${doy}`;
         const fileText = buildHMSCsvLines(g).join('\n');
         zip.file(name, fileText);
       });
     });
+
+    zip.file(`Antenna-${byId('antennaId').value}_Sch_${formatDateDDMMMYYYYUTC()}.psh`, schedFileContenets);
+    
     const blob = await zip.generateAsync({ type: 'blob' });
     downloadBlob('groups.zip', blob);
   });
