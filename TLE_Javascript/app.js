@@ -82,6 +82,57 @@ function ensureDefaultTimeRange() {
   if (!byId('endTime').value) setDateTimeUTC('endTime', DEFAULT_END_UTC);
 }
 
+// Pull rev number at epoch from TLE line 2 (last integer field)
+// Fixed-width parse per TLE spec (1-based columns):
+// L2 53-63: mean motion [rev/day]  → JS slice(52, 63)
+// L2 64-68: revolution @ epoch     → JS slice(63, 68)
+// L2 69   : checksum (ignore)
+
+// Fixed-width parse per TLE spec (1-based columns):
+// L2 53-63: mean motion [rev/day]  → JS slice(52, 63)
+// L2 64-68: revolution @ epoch     → JS slice(63, 68)
+// L2 69   : checksum (ignore)
+
+function parseMeanMotionRevPerDayFromL2(l2) {
+  if (!l2 || l2.length < 63) return NaN;
+  return parseFloat(l2.slice(52, 63).trim()); // "53-63"
+}
+
+function parseRevNumFromL2Fixed(l2) {
+  if (!l2 || l2.length < 68) return NaN;
+  const field = l2.slice(63, 68); // "64-68"
+  const n = parseInt(field.trim(), 10);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function tleHasRevField(l2) {
+  return !!(l2 && l2.length >= 68 && /\d/.test(l2.slice(63, 68)));
+}
+
+// Orbit number at a time "whenDate" = rev@epoch + (meanMotion[rev/day] * daysSinceEpoch)
+function orbitNumberAtUsingTLE(satrec, tleL2, whenDate) {
+  if (!satrec || !tleL2) return NaN;
+
+  const rev0 = parseRevNumFromL2Fixed(tleL2);
+  const nRevPerDay = parseMeanMotionRevPerDayFromL2(tleL2);
+
+  if (!Number.isFinite(rev0) || !Number.isFinite(nRevPerDay)) return NaN;
+
+  // days since epoch (Julian)
+  const d = whenDate;
+  const jd = satellite.jday(
+    d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate(),
+    d.getUTCHours(), d.getUTCMinutes(),
+    d.getUTCSeconds() + d.getUTCMilliseconds() / 1000
+  );
+  const daysSinceEpoch = jd - satrec.jdsatepoch;
+
+  const revs = nRevPerDay * daysSinceEpoch;
+  // epsilon to avoid fencepost errors when exactly on an orbit boundary
+  return Math.floor(rev0 + revs + 1e-8);
+}
+
+
 /* ---------- Atmosphere helpers (barometric pressure + Bennett refraction) ---------- */
 // Approx barometric formula (sea-level p0=1013.25 mbar), altitude in **meters**
 function pressure_mbar_from_alt_m(alt_m, p0mbar = 1013.25) {
@@ -339,6 +390,7 @@ function renderGroupsTable() {
   resultsByTLE.forEach((tleRes, tleIdx) => {
     tleRes.groups.forEach((g, gi) => {
       const s = tleRes.stats[gi];
+      const orbit = orbitNumberAtUsingTLE(tleRes.satrec, tleRes.tle?.l2, new Date(s.start));
       groupsFlat.push({
         tleIdx,
         gi,
@@ -350,6 +402,7 @@ function renderGroupsTable() {
         startAz: s.startAz,
         endAz: s.endAz,
         samples: s.samples,
+        orbit
       });
     });
   });
@@ -370,6 +423,7 @@ function renderGroupsTable() {
     const cells = [
       ++counter,
       item.tleName,
+      item.orbit,                // << NEW COLUMN
       item.start,
       item.end,
       fixed(item.minEl, getDecimalCount()),
@@ -418,7 +472,10 @@ function renderGroupModalPage() {
   const r = resultsByTLE[tleIdx];
   const g = r?.groups?.[gi] || [];
   const title = byId('groupTitle');
-  title.textContent = `${r?.name || 'TLE'} — Group ${gi + 1} (${g.length} rows)`;
+  const firstIso = g[0]?.[IDX_T];
+  const orbit = firstIso ? orbitNumberAtUsingTLE(r?.satrec, r?.tle?.l2, new Date(firstIso)) : 0;
+  title.textContent = `${r?.name || 'TLE'} — Group ${gi + 1} (Orbit ${orbit}, ${g.length} rows)`;
+
 
   const rppSel = byId('modalRowsPerPage');
   const rpp = parseInt(rppSel?.value || modalState.rpp, 10) || 20;
@@ -544,7 +601,8 @@ async function generate() {
       );
 
       const { groups, stats } = groupRows(rows, minEl);
-      resultsByTLE.push({ name: tle.name, allRows: rows, groups, stats });
+      // resultsByTLE.push({ name: tle.name, allRows: rows, groups, stats });
+      resultsByTLE.push({ name: tle.name, tle, satrec, allRows: rows, groups, stats });
     }
 
     renderGroupsTable();
