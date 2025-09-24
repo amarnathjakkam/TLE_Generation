@@ -1,15 +1,12 @@
 <!doctype html>
 <html lang="en">
-
 <head>
   <meta charset="utf-8" />
   <title>TLE Pass Generator</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link href="styles.css" rel="stylesheet" />
   <!-- Libraries (UMD) -->
-  <script src="https://cdn.jsdelivr.net/npm/satellite.js@6.0.1/dist/satellite.min.js" defer
-    crossorigin="anonymous"></script>
-  <!-- <script src="satellite_5.min.js"  ></script> -->
+  <script src="https://cdn.jsdelivr.net/npm/satellite.js@6.0.1/dist/satellite.min.js" defer crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer crossorigin="anonymous"></script>
   <!-- App -->
   <script src="app.js" defer></script>
@@ -52,7 +49,12 @@
 
       <div class="card">
         <h2>Observer</h2>
-        <div class="grid-3">
+        <div class="grid-4">
+          <label>
+            Antenna
+            <input id="antennaId" type="text"  value="A01"   />
+          </label>
+
           <label>
             Latitude (°)
             <input id="obsLat" type="number" step="0.000001" value="17.268660" />
@@ -73,11 +75,11 @@
         <div class="grid-2">
           <label>
             Start (UTC)
-            <input id="startTime" type="datetime" step="1"/>
+            <input id="startTime" type="datetime-local" step="1"/>
           </label>
           <label>
             End (UTC)
-            <input id="endTime" type="datetime" step="1"/>
+            <input id="endTime" type="datetime-local" step="1"/>
           </label>
         </div>
         <div class="grid-3">
@@ -95,6 +97,8 @@
           </label>
         </div>
         <div class="grid-3">
+          
+
           <label class="checkbox">
             <input id="applyRefraction" type="checkbox" checked />
             Apply Refraction
@@ -137,6 +141,7 @@
         <div id="progressWrap" class="progress hidden" aria-hidden="true">
           <div id="progressBar"></div>
         </div>
+        <div id="statusText" class="muted" style="margin-top:6px;"></div>
       </div>
     </section>
 
@@ -217,5 +222,4 @@
     <div class="modal-backdrop" aria-hidden="true"></div>
   </div>
 </body>
-
 </html>

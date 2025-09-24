@@ -45,6 +45,7 @@ h2 { font-size: 1.1rem; color: var(--muted); font-weight: 600; }
 .grid-1-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
 .grid-2   { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
 .grid-3   { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px 12px; }
+.grid-4   { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px 12px; }
 .grid-1-2 .full { grid-column: 1 / span 2; }
 
 label { display: flex; flex-direction: column; gap: 6px; font-size: .9rem; color: var(--muted); }
@@ -84,7 +85,7 @@ thead th { position: sticky; top: 0; background: #0b1220; z-index: 1; }
 .modal.hidden { display: none; }
 .modal {
   position: fixed; inset: 0; z-index: 1000;
-  pointer-events: none; /* route clicks only to content/backdrop */
+  pointer-events: none;
 }
 .modal-content {
   position: relative; z-index: 2;
@@ -97,12 +98,12 @@ thead th { position: sticky; top: 0; background: #0b1220; z-index: 1; }
   border-radius: 12px;
   overflow: hidden;
   display: flex; flex-direction: column;
-  pointer-events: auto; /* accept clicks */
+  pointer-events: auto;
 }
 .modal-backdrop {
   position: absolute; inset: 0; z-index: 1;
   background: rgba(0,0,0,0.5);
-  pointer-events: auto; /* accept clicks for closing */
+  pointer-events: auto;
 }
 .modal-header {
   display: flex; align-items: center; justify-content: space-between;

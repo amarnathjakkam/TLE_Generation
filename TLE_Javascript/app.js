@@ -1,13 +1,30 @@
 /* =========================
-   TLE Pass Generator – app.js (UTC + Bennett refraction)
+   TLE Pass Generator – app.js (UTC + Bennett refraction + smooth progress + space-CSV)
    ========================= */
 
 /* ---------- Constants / Globals ---------- */
 const IDX_T = 0, IDX_AZ = 1, IDX_EL = 2;
 
-// Default time range (UTC) — 24-08-2025 02:00 → 26-08-2025 02:00
-const DEFAULT_START_UTC = new Date(Date.UTC(2025, 7, 25, 2, 0, 0));
-const DEFAULT_END_UTC = new Date(Date.UTC(2025, 7, 26, 2, 0, 0));
+function dayOfYearUTC(isoUtcOrDate) {
+  const d = new Date(isoUtcOrDate);
+  const start = Date.UTC(d.getUTCFullYear(), 0, 1);
+  const today = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+  const n = Math.floor((today - start) / 86400000) + 1; // 1..366
+  return String(n).padStart(3, '0'); // "001".."366"
+}
+
+
+// Default time range (UTC) — current UTC → +4 days
+const nowUTC = new Date();
+const DEFAULT_START_UTC = new Date(Date.UTC(
+  nowUTC.getUTCFullYear(),
+  nowUTC.getUTCMonth(),
+  nowUTC.getUTCDate(),
+  nowUTC.getUTCHours(),
+  nowUTC.getUTCMinutes(),
+  nowUTC.getUTCSeconds()
+));
+const DEFAULT_END_UTC = new Date(+DEFAULT_START_UTC + 4 * 24 * 60 * 60 * 1000); // +4 days
 
 // Built-in fallback TLE (works even if no file is loaded)
 const DEFAULT_TLE_TEXT = `
@@ -34,24 +51,17 @@ function isoUTC(d) { return new Date(d).toISOString().replace('.000', ''); }
 function fixed(n, d = 2) { return (Number.isFinite(n) ? n : 0).toFixed(d); }
 
 function sanitizeName(s) { return (s || 'tle').replace(/[^\w\-]+/g, '_').slice(0, 80); }
-function escCsv(v) { const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; }
-function csv(headers, rows) {
-  const h = headers.map(escCsv).join(',');
-  const b = rows.map(r => r.map(escCsv).join(',')).join('\n');
-  return `${h}\n${b}`;
-}
 function downloadBlob(name, blob) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = name; document.body.appendChild(a); a.click();
   URL.revokeObjectURL(url); a.remove();
 }
-function downloadCsv(name, headers, rows) {
-  downloadBlob(name, new Blob([csv(headers, rows)], { type: 'text/csv' }));
+function downloadText(name, text) {
+  downloadBlob(name, new Blob([text], { type: 'text/plain' }));
 }
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
 /* ---------- UTC datetime-local filler ---------- */
 // Force inputs to display **UTC** values (not local)
 function setDateTimeUTC(id, date) {
@@ -61,6 +71,12 @@ function setDateTimeUTC(id, date) {
   const H = pad2(dt.getUTCHours()), M = pad2(dt.getUTCMinutes()), S = pad2(dt.getUTCSeconds());
   el.value = `${y}-${m}-${d}T${H}:${M}:${S}`;
 }
+
+function getDecimalCount(){
+    if (byId('decimals').value != undefined) return parseInt(byId('decimals').value, 10);
+    return 2;
+}
+
 function ensureDefaultTimeRange() {
   if (!byId('startTime').value) setDateTimeUTC('startTime', DEFAULT_START_UTC);
   if (!byId('endTime').value) setDateTimeUTC('endTime', DEFAULT_END_UTC);
@@ -75,11 +91,9 @@ function pressure_mbar_from_alt_m(alt_m, p0mbar = 1013.25) {
   return p0mbar * Math.pow(1.0 - (L * h) / T0, (g * M) / (R * L));
 }
 
-// Bennett/Saemundsson style refraction in **degrees**; returns corrected elevation (deg)
-// altDeg (geometric), tempC, pressure in mbar
+// Bennett/Saemundsson refraction in **degrees**; returns corrected elevation (deg)
 function refract_bennett_deg(altDeg, tempC, pressureMbar) {
-  // If below horizon, skip correction
-  if (altDeg <= -1.0) return altDeg;
+  if (altDeg <= -1.0) return altDeg; // below horizon, skip
   const altRad = toRad(altDeg);
   const R_arcmin = (pressureMbar / 1010.0) * (283.0 / (273.0 + tempC))
     * (1.02 / Math.tan(altRad + (10.3 * Math.PI / 180.0) / (altDeg + 5.11)));
@@ -132,19 +146,56 @@ function loadDefaultTLEIfEmpty() {
   fillTlePickerToFields();
 }
 
-/* ---------- Compute track (UTC, Bennett refraction) ---------- */
-function computeTrackForTLE(satrec, startDate, endDate, stepMs, obs, doRefract, tempC) {
+/* ---------- Space-CSV helpers (HH MM SS.zzz  Az EL) ---------- */
+function fmtHMSmsFromISO(isoUtc) {
+  const d = new Date(isoUtc);
+  const HH = pad2(d.getUTCHours());
+  const MM = pad2(d.getUTCMinutes());
+  const SS = pad2(d.getUTCSeconds());
+  const zzz = String(d.getUTCMilliseconds()).padStart(3, '0');
+  return `${HH} ${MM} ${SS}.${zzz}`;
+}
+function fmtFixedSigned(value, intDigits, fracDigits) {
+  if (!Number.isFinite(value)) return ''; // blank for NaN
+  const sign = value < 0 ? '-' : '';
+  const abs = Math.abs(value);
+  const i = Math.floor(abs).toString().padStart(intDigits, '0');
+  const f = abs.toFixed(fracDigits).split('.')[1];
+  return `${sign}${i}.${f}`;
+}
+function fmtAz(az) { return fmtFixedSigned(az, 3, getDecimalCount()); } // XXX.XX
+function fmtEl(el) { return fmtFixedSigned(el, 2, getDecimalCount()); } // XX.XX
+function buildHMSCsvLines(rows) {
+  const lines = ['HH MM SS.zzz  Az EL'];
+  for (const r of rows) {
+    const t = fmtHMSmsFromISO(r[0]);
+    const a = fmtAz(r[1]);
+    const e = fmtEl(r[2]);
+    lines.push(`${t} ${a} ${e}`);
+  }
+  return lines;
+}
+
+/* ---------- Compute track (UTC, Bennett refraction) with per-step progress ---------- */
+function computeTrackForTLE(
+  satrec, startDate, endDate, stepMs, obs, doRefract, tempC,
+  onStepProgress /* optional: (fraction 0..1) => void */
+) {
   const rows = [];
   const start = +startDate, end = +endDate, step = Math.max(100, stepMs | 0);
+  const totalSteps = Math.max(1, Math.floor((end - start) / step) + 1);
+  let stepIdx = 0;
+
   // Pressure from **meters** altitude
   const Pmbar = pressure_mbar_from_alt_m(obs.alt_m);
 
   for (let t = start; t <= end; t += step) {
     const dt = new Date(t);                  // UTC based
-    const gmst = satellite.gstime(dt);       // v6 API (index.html loads 6.x):contentReference[oaicite:2]{index=2}
+    const gmst = satellite.gstime(dt);       // satellite.js v6
     const pv = satellite.propagate(satrec, dt);
     if (!pv.position) {
       rows.push([isoUTC(dt), NaN, NaN]);
+      stepIdx++; if (onStepProgress) onStepProgress(stepIdx / totalSteps);
       continue;
     }
 
@@ -172,13 +223,17 @@ function computeTrackForTLE(satrec, startDate, endDate, stepMs, obs, doRefract, 
     }
 
     rows.push([isoUTC(dt), Number(az.toFixed(2)), Number(el.toFixed(2))]);
+
+    // per-step progress
+    stepIdx++;
+    if (onStepProgress) onStepProgress(stepIdx / totalSteps);
   }
   return rows;
 }
 
 /* ---------- Grouping & stats ---------- */
 function groupRows(rows, minEl) {
-  // Group where Az>0 and El>0 (per table heading in index.html):contentReference[oaicite:3]{index=3}
+  // Group where Az>0 and El>minEl
   const groups = [];
   let cur = [];
   for (const r of rows) {
@@ -292,10 +347,10 @@ function renderGroupsTable() {
       item.tleName,
       item.start,
       item.end,
-      fixed(item.minEl, 2),
-      fixed(item.maxEl, 2),
-      fixed(item.startAz, 2),
-      fixed(item.endAz, 2),
+      fixed(item.minEl, getDecimalCount()),
+      fixed(item.maxEl, getDecimalCount()),
+      fixed(item.startAz, getDecimalCount()),
+      fixed(item.endAz, getDecimalCount()),
       item.samples
     ];
     cells.forEach(val => {
@@ -354,7 +409,7 @@ function renderGroupModalPage() {
   tbody.innerHTML = '';
   pageRows.forEach(row => {
     const tr = document.createElement('tr');
-    [row[IDX_T], fixed(row[IDX_AZ], 2), fixed(row[IDX_EL], 2)].forEach(v => {
+    [row[IDX_T], fixed(row[IDX_AZ], getDecimalCount()), fixed(row[IDX_EL], getDecimalCount())].forEach(v => {
       const td = document.createElement('td'); td.textContent = v; tr.appendChild(td);
     });
     tbody.appendChild(tr);
@@ -364,10 +419,11 @@ function renderGroupModalPage() {
   byId('modalPrevBtn').disabled = modalState.page <= 1;
   byId('modalNextBtn').disabled = modalState.page >= totalPages;
 
-  // Download current group CSV
+  // Download current group CSV (space format)
   byId('downloadGroupCsv').onclick = () => {
     const name = `${sanitizeName(r?.name || 'TLE')}__group_${String(gi + 1).padStart(2, '0')}.csv`;
-    downloadCsv(name, ['time_utc', 'az_deg', 'el_deg'], g);
+    const lines = buildHMSCsvLines(g);
+    downloadText(name, lines.join('\n'));
   };
 }
 
@@ -382,8 +438,8 @@ async function generate() {
   const tiltDeg = parseFloat(byId('tiltDeg').value || '0') || 0;
   const tiltAzDeg = parseFloat(byId('tiltAzDeg').value || '0') || 0;
 
-  const startStr = byId('startTime').value; // "YYYY-MM-DDTHH:mm"
-  const endStr = byId('endTime').value;   // "YYYY-MM-DDTHH:mm"
+  const startStr = byId('startTime').value; // "YYYY-MM-DDTHH:mm:ss"
+  const endStr = byId('endTime').value;     // "YYYY-MM-DDTHH:mm:ss"
   const stepMs = parseInt(byId('resolutionMs').value || '1000', 10) || 1000;
 
   const doRefract = byId('applyRefraction').checked;
@@ -391,7 +447,7 @@ async function generate() {
 
   const mode = byId('whichTles').value || 'current';
 
-  // Build TLE list based on mode (UI is from index.html):contentReference[oaicite:4]{index=4}
+  // Build TLE list based on mode
   let tleList = [];
   if (mode === 'current') {
     const name = byId('tleName').value.trim();
@@ -417,38 +473,63 @@ async function generate() {
   let startDate, endDate;
   if (startStr && endStr) {
     startDate = new Date(startStr + "Z");
-    endDate = new Date(endStr + "Z");
-    if (!isFinite(+startDate) || !isFinite(+endDate) || (+endDate <= +startDate)) {
-      alert('Invalid time range. Ensure Start < End.');
+    endDate   = new Date(endStr + "Z");
+    if (!isFinite(+startDate) || !isFinite(+endDate)) {
+      alert('Invalid time range. Please enter valid UTC datetimes.');
+      return;
+    }
+    // Rule 1: start <= end
+    if (+endDate < +startDate) {
+      alert('Start time must be less than or equal to End time.');
+      return;
+    }
+    // Rule 2: maximum span is 7 days
+    const MAX_SPAN_MS = 7 * 24 * 60 * 60 * 1000;
+    if ((+endDate - +startDate) > MAX_SPAN_MS) {
+      alert('Maximum allowed range is 7 days. Please shorten the interval.');
       return;
     }
   } else {
     startDate = new Date(DEFAULT_START_UTC);
-    endDate = new Date(DEFAULT_END_UTC);
+    endDate   = new Date(DEFAULT_END_UTC);
   }
 
   // Compute
   resultsByTLE = [];
   setBusy(true); setProgress(5);
+  const status = byId('statusText');
   try {
-
     const minEl = parseFloat(byId('minElFilter')?.value || '0') || 0;
     for (let i = 0; i < tleList.length; i++) {
       const tle = tleList[i];
       const satrec = satellite.twoline2satrec(tle.l1, tle.l2);
       const obs = { lat, lon, alt_m, tiltDeg, tiltAzDeg };
-      const rows = computeTrackForTLE(satrec, startDate, endDate, stepMs, obs, doRefract, tempC);
+
+      // Allocate 80% band among TLEs, then interpolate within each TLE
+      const baseStart = 5 + Math.round((i / tleList.length) * 80);
+      const baseEnd   = 5 + Math.round(((i + 1) / tleList.length) * 80);
+
+      const rows = computeTrackForTLE(
+        satrec, startDate, endDate, stepMs, obs, doRefract, tempC,
+        (f) => {
+          const pct = Math.round(baseStart + (baseEnd - baseStart) * Math.min(Math.max(f, 0), 1));
+          setProgress(pct);
+          if (status) status.textContent = `Processing ${tle.name} (${i + 1}/${tleList.length}) — ${pct}%`;
+        }
+      );
+
       const { groups, stats } = groupRows(rows, minEl);
-      resultsByTLE.push({ name: tle.name, allRows: rows, groups, stats }); 
-      setProgress(5 + Math.round(((i + 1) / tleList.length) * 80));
+      resultsByTLE.push({ name: tle.name, allRows: rows, groups, stats });
     }
+
     renderGroupsTable();
     setProgress(100);
+    if (status) status.textContent = 'Done — 100%';
   } catch (e) {
     console.error(e);
     alert('Generation failed. See console for details.');
   } finally {
-    setTimeout(() => { setBusy(false); setProgress(0); }, 600);
+    setTimeout(() => { setBusy(false); setProgress(0); if (status) status.textContent = ''; }, 600);
   }
 }
 
@@ -469,24 +550,38 @@ async function handleTleFile(file) {
 
 /* ---------- Downloads (All/Groups ZIP) ---------- */
 function setupDownloads() {
+  // All-in-one file (space-CSV)
   byId('downloadAllBtn').addEventListener('click', () => {
     const any = resultsByTLE.some(r => r.allRows.length);
     if (!any) return;
-    const rows = [];
+
+    const header = 'HH MM SS.zzz  Az EL';
+    const lines = [header];
+
     resultsByTLE.forEach(r => {
-      r.allRows.forEach(a => rows.push([r.name, ...a]));
+      r.allRows.forEach(a => {
+        const t = fmtHMSmsFromISO(a[0]);
+        const az = fmtAz(a[1]);
+        const el = fmtEl(a[2]);
+        lines.push(`${t} ${az} ${el}`);
+      });
     });
-    downloadCsv('all_results_combined.csv', ['tle', 'time_utc', 'az_deg', 'el_deg'], rows);
+
+    downloadText('all_results_combined.csv', lines.join('\n'));
   });
 
+  // Per-group files in a ZIP (space-CSV)
   byId('downloadGroupsZipBtn').addEventListener('click', async () => {
     const has = resultsByTLE.some(r => r.groups.length);
     if (!has) return;
     const zip = new JSZip();
     resultsByTLE.forEach(r => {
       r.groups.forEach((g, gi) => {
-        const name = `${sanitizeName(r.name)}__group_${String(gi + 1).padStart(2, '0')}.csv`;
-        zip.file(name, csv(['time_utc', 'az_deg', 'el_deg'], g));
+        const firstIso = g[0][IDX_T];     // group's first angle timestamp (ISO UTC)
+        const doy = dayOfYearUTC(firstIso);
+        const name = `pts${String(gi).padStart(5, '0')}_${sanitizeName(r.name)}_${byId('antennaId').value}.${doy}`;
+        const fileText = buildHMSCsvLines(g).join('\n');
+        zip.file(name, fileText);
       });
     });
     const blob = await zip.generateAsync({ type: 'blob' });
@@ -517,10 +612,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('.modal-backdrop').addEventListener('click', closeModal);
   byId('modalPrevBtn').addEventListener('click', () => { modalState.page--; renderGroupModalPage(); });
   byId('modalNextBtn').addEventListener('click', () => { modalState.page++; renderGroupModalPage(); });
-  byId('modalFirstBtn').addEventListener('click', () => {
-    modalState.page = 1;
-    renderGroupModalPage();
-  });
+  byId('modalFirstBtn').addEventListener('click', () => { modalState.page = 1; renderGroupModalPage(); });
   byId('modalLastBtn').addEventListener('click', () => {
     const [tleIdxStr, giStr] = modalState.groupKey.split(':');
     const tleIdx = parseInt(tleIdxStr, 10), gi = parseInt(giStr, 10);
