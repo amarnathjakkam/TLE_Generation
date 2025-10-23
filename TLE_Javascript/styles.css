@@ -29,7 +29,7 @@ h2 { font-size: 1.1rem; color: var(--muted); font-weight: 600; }
   grid-template-columns: 1.1fr .9fr;
   gap: 16px;
   padding: 16px;
-  max-width: 1400px;
+  max-width: 99%;
   margin: 0 auto;
 }
 

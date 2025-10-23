@@ -24,7 +24,7 @@ const DEFAULT_START_UTC = new Date(Date.UTC(
   nowUTC.getUTCMinutes(),
   nowUTC.getUTCSeconds()
 ));
-const DEFAULT_END_UTC = new Date(+DEFAULT_START_UTC + 4 * 24 * 60 * 60 * 1000); // +4 days
+const DEFAULT_END_UTC = new Date(+DEFAULT_START_UTC + 1 * 24 * 60 * 60 * 1000); // +1 days
 
 // Built-in fallback TLE (works even if no file is loaded)
 const DEFAULT_TLE_TEXT = `
@@ -33,6 +33,7 @@ EM1
 2 44078  98.2808 291.9629 0018719  34.1424  38.1671 14.43768520337337
 `.trim();
 
+let scheduleDetailes = {};
 let parsedTLEs = [];          // [{name,l1,l2}]
 let resultsByTLE = [];        // per-TLE results (rows & groups)
 let groupsFlat = [];          // flattened groups for the table & modal navigation
@@ -44,6 +45,7 @@ const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const byId = (id) => document.getElementById(id);
 
+function padding(n, length=3, padByte='0') { return String(n).padStart(length, padByte); }
 function pad2(n) { return String(n).padStart(2, '0'); }
 function toRad(d) { return d * Math.PI / 180; }
 function toDeg(r) { return r * 180 / Math.PI; }
@@ -69,7 +71,8 @@ function setDateTimeUTC(id, date) {
   const dt = new Date(date);
   const y = dt.getUTCFullYear(), m = pad2(dt.getUTCMonth() + 1), d = pad2(dt.getUTCDate());
   const H = pad2(dt.getUTCHours()), M = pad2(dt.getUTCMinutes()), S = pad2(dt.getUTCSeconds());
-  el.value = `${y}-${m}-${d}T${H}:${M}:${S}`;
+  // el.value = `${y}-${m}-${d}T${H}:${M}:${S}`;
+  el.value = `${y}-${m}-${d}`;
 }
 
 function getDecimalCount(){
@@ -213,6 +216,15 @@ function schedFmtDateFromISO(d = new Date()) {
   const MM = pad2(d.getUTCMinutes());
   const SS = pad2(d.getUTCSeconds());
   return `${dd}${mm}${yyyy}${HH}${MM}${SS}`;
+}
+
+
+function schedFmtDDMMYYYYFromISO(isoUtc) {
+  const d = new Date(isoUtc);
+  const dd = pad2(d.getUTCDate());
+  const mm = pad2(d.getUTCMonth()+1);
+  const yyyy = pad2(d.getUTCFullYear());
+  return `${dd}${mm}${yyyy}`;
 }
 
 function schedFmtHMSmsFromISO(isoUtc) {
@@ -566,9 +578,9 @@ async function generate() {
       return;
     }
     // Rule 2: maximum span is 7 days
-    const MAX_SPAN_MS = 7 * 24 * 60 * 60 * 1000;
+    const MAX_SPAN_MS = 1 * 24 * 60 * 60 * 1000;
     if ((+endDate - +startDate) > MAX_SPAN_MS) {
-      alert('Maximum allowed range is 7 days. Please shorten the interval.');
+      alert('Maximum allowed range is 1 days. Please shorten the interval.');
       return;
     }
   } else {
@@ -577,7 +589,9 @@ async function generate() {
   }
 
   // Compute
-  resultsByTLE = [];
+  resultsByTLE = []; 
+  scheduleDetailes = {startDate, endDate, satCount: tleList.length, passCount: 0}
+  let passCount = 0;
   setBusy(true); setProgress(5);
   const status = byId('statusText');
   try {
@@ -603,7 +617,10 @@ async function generate() {
       const { groups, stats } = groupRows(rows, minEl);
       // resultsByTLE.push({ name: tle.name, allRows: rows, groups, stats });
       resultsByTLE.push({ name: tle.name, tle, satrec, allRows: rows, groups, stats });
+      passCount += groups.length;
     }
+
+    scheduleDetailes = {startDate, endDate, satCount: tleList.length, passCount: passCount};
 
     renderGroupsTable();
     setProgress(100);
@@ -659,32 +676,37 @@ function setupDownloads() {
     if (!has) return;
     const zip = new JSZip();
     let passIndex = 0;
-    let schedFileContenets = `HYD${schedFmtDateFromISO()}000$$$$$$$$$$$\r\n`;
-    resultsByTLE.forEach(r => {
-      r.groups.forEach((g, gi) => {
+    let schedFileContenets = '';
+    resultsByTLE.forEach(satObj => {
+      satObj.groups.forEach((g, gi) => {
         const firstIso = g[0][IDX_T];     // group's first angle timestamp (ISO UTC)
         const lastIso = g[g.length-1][IDX_T];     // group's first angle timestamp (ISO UTC)
 
         ++passIndex;
+        
+        const orbit = orbitNumberAtUsingTLE(satObj.satrec, satObj.tle?.l2, new Date(firstIso));
+        console.log('satObj', satObj, firstIso, orbit, satObj.stats[gi].maxEl)
         let timseRangeStr = schedFmtHMSmsFromISO(firstIso) + schedFmtHMSmsFromISO(lastIso);
         schedFileContenets = schedFileContenets + String(passIndex).padStart(3, '0') 
-                  + sanitizeName(r.name) 
-                  + String(gi).padStart(6, '0') //need to check
+                  + sanitizeName(satObj.name) 
+                  + String(orbit).padStart(6, '0') //need to check
                   + timseRangeStr
-                  + String(0).padStart(4, '0') //need to check
+                  + String(parseInt(satObj.stats[gi].maxEl*100)).padStart(4, '0') //need to check
                   + `$$$$$$$$$$$$$$$$$$$$000000${timseRangeStr}0000000000000$$$$$$$$$$$$$$$$$A00C00D00000$$$$\r\n`;
 
         const doy = dayOfYearUTC(firstIso);
-        const name = `pts${String(gi).padStart(5, '0')}_${sanitizeName(r.name)}_${byId('antennaId').value}.${doy}`;
+        const name = `pts${String(orbit).padStart(5, '0')}_${sanitizeName(satObj.name)}_${byId('antennaId').value}.${doy}`;
         const fileText = buildHMSCsvLines(g).join('\n');
         zip.file(name, fileText);
       });
     });
-
-    zip.file(`Antenna-${byId('antennaId').value}_Sch_${formatDateDDMMMYYYYUTC()}.psh`, schedFileContenets);
+    console.log('scheduleDetailes', scheduleDetailes, resultsByTLE)
+    schedFileContenets = `HYD${schedFmtDDMMYYYYFromISO(scheduleDetailes.startDate)}${pad2(scheduleDetailes.satCount)}${padding(scheduleDetailes.passCount)}0000$$$$$$$$$$$\r\n`
+                         + schedFileContenets;
+    zip.file(`Antenna-${byId('antennaId').value}_Sch_${formatDateDDMMMYYYYUTC(scheduleDetailes.startDate)}.psh`, schedFileContenets);
     
     const blob = await zip.generateAsync({ type: 'blob' });
-    downloadBlob('groups.zip', blob);
+    downloadBlob(`schedule_${schedFmtDDMMYYYYFromISO(scheduleDetailes.startDate)}.zip`, blob);
   });
 }
 
